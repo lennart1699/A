@@ -5,27 +5,35 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Physics Playground</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #0e1013; overflow: hidden; }
+  html, body { margin: 0; height: 100%; background: #0e1013; overflow: hidden;
+               font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+               color: #7c8698; -webkit-user-select: none; user-select: none; }
   canvas { display: block; }
+  #legend { position: fixed; left: 14px; bottom: 12px; white-space: pre; pointer-events: none; }
+  #legend b { color: #aab4c4; font-weight: normal; }
 </style>
 </head>
 <body>
 <canvas id="view"></canvas>
+<div id="legend"></div>
 <script>
 "use strict";
 
 /* ------------------------------------------------------------------ *
  * Core: Verlet point masses + distance constraints.
- * A body owns its particles and knows two things only:
- *   satisfyConstraints()  -- called ITERATIONS times per fixed step
- *   draw(ctx)             -- called once per rendered frame
+ *
+ * A body owns its particles and implements two methods:
+ *   satisfyConstraints(world)  -- called `iterations` times per fixed step
+ *   draw(ctx, world)           -- called once per rendered frame
+ * Everything else (integration, forces, picking, bounds) is the world's
+ * job, so a new body type is one class and nothing more.
  * ------------------------------------------------------------------ */
 
 class Particle {
   constructor(x, y, pinned = false) {
     this.x = x; this.y = y;      // current position
     this.px = x; this.py = y;    // previous position (velocity is implicit)
-    this.ax = 0; this.ay = 0;    // accumulated acceleration for this step
+    this.ax = 0; this.ay = 0;    // acceleration accumulated for this step
     this.pinned = pinned;
   }
 }
@@ -34,6 +42,7 @@ class Body {
   constructor() { this.particles = []; }
   satisfyConstraints(world) {}
   draw(ctx, world) {}
+  tear(x, y, radius) {}          // optional: right-drag cutting
 }
 
 const DT = 1 / 60;               // fixed simulation timestep
@@ -45,22 +54,48 @@ class World {
     this.ctx = canvas.getContext("2d");
     this.bodies = [];
     this.gravity = 900;          // px / s^2
-    this.wind = 0;               // px / s^2, +x
+    this.gravityOn = true;
+    this.wind = 600;             // px / s^2, gusting along +x
+    this.windOn = false;
     this.damping = 0.995;        // velocity retained per step
     this.iterations = 8;         // relaxation passes per step
     this.accumulator = 0;
     this.time = 0;
+    this.grab = null;            // { p, wasPinned, vx, vy }
+    this.mouse = { x: 0, y: 0 };
   }
 
   add(body) { this.bodies.push(body); return body; }
+  clear() { this.bodies.length = 0; this.grab = null; }
+
+  get width() { return this.canvas.width / DPR; }
+  get height() { return this.canvas.height / DPR; }
 
   eachParticle(fn) {
     for (const b of this.bodies) for (const p of b.particles) fn(p, b);
   }
 
+  particleCount() {
+    let n = 0;
+    for (const b of this.bodies) n += b.particles.length;
+    return n;
+  }
+
+  // Nearest particle to a point, within `radius`.
+  pick(x, y, radius) {
+    let best = null, bestD = radius * radius;
+    this.eachParticle(p => {
+      const dx = p.x - x, dy = p.y - y, d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = p; }
+    });
+    return best;
+  }
+
   accumulateForces() {
-    const gx = this.wind * (0.6 + 0.4 * Math.sin(this.time * 1.7));
-    this.eachParticle(p => { p.ax = gx; p.ay = this.gravity; });
+    const gy = this.gravityOn ? this.gravity : 0;
+    // A little sinusoidal gust so wind doesn't read as a constant tilt.
+    const gx = this.windOn ? this.wind * (0.65 + 0.35 * Math.sin(this.time * 1.7)) : 0;
+    this.eachParticle(p => { p.ax = gx; p.ay = gy; });
   }
 
   integrate() {
@@ -74,8 +109,21 @@ class World {
     });
   }
 
+  // The dragged particle is pinned to the cursor, but we remember how fast
+  // it travelled so releasing it flings the body instead of dropping it.
+  followCursor() {
+    const g = this.grab;
+    if (!g) return;
+    const p = g.p, max = 40;
+    let dx = this.mouse.x - p.x, dy = this.mouse.y - p.y;
+    const d = Math.hypot(dx, dy);
+    if (d > max) { dx *= max / d; dy *= max / d; }
+    p.x += dx; p.y += dy;
+    g.vx = dx; g.vy = dy;
+  }
+
   constrainToBounds() {
-    const w = this.canvas.width / DPR, h = this.canvas.height / DPR, m = 2;
+    const w = this.width, h = this.height, m = 2;
     this.eachParticle(p => {
       if (p.x < m) p.x = m; else if (p.x > w - m) p.x = w - m;
       if (p.y < m) p.y = m; else if (p.y > h - m) p.y = h - m;
@@ -86,14 +134,15 @@ class World {
     this.time += DT;
     this.accumulateForces();
     this.integrate();
+    this.followCursor();
     for (let i = 0; i < this.iterations; i++) {
       for (const b of this.bodies) b.satisfyConstraints(this);
     }
     this.constrainToBounds();
   }
 
-  // Fixed timestep with an accumulator: the sim runs at 60Hz regardless
-  // of how fast or slow the display refreshes.
+  // Fixed timestep with an accumulator: the sim always advances in 1/60s
+  // slices no matter how fast or slow the display refreshes.
   update(frameSeconds) {
     this.accumulator += Math.min(frameSeconds, 0.25);
     let steps = 0;
@@ -102,16 +151,59 @@ class World {
       this.accumulator -= DT;
       steps++;
     }
-    if (steps === MAX_STEPS) this.accumulator = 0;
+    if (steps === MAX_STEPS) this.accumulator = 0;  // drop the backlog
   }
 
   draw() {
     const ctx = this.ctx;
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.fillStyle = "#0e1013";
-    ctx.fillRect(0, 0, this.canvas.width / DPR, this.canvas.height / DPR);
+    ctx.fillRect(0, 0, this.width, this.height);
     for (const b of this.bodies) b.draw(ctx, this);
+    if (this.grab) {
+      ctx.strokeStyle = "#e6ebf2";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(this.grab.p.x, this.grab.p.y, 5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
+
+  startDrag(x, y) {
+    const p = this.pick(x, y, 30);
+    if (!p) return false;
+    this.grab = { p, wasPinned: p.pinned, vx: 0, vy: 0 };
+    p.pinned = true;
+    return true;
+  }
+
+  endDrag() {
+    const g = this.grab;
+    if (!g) return;
+    g.p.pinned = g.wasPinned;
+    g.p.px = g.p.x - g.vx;      // hand back the drag velocity
+    g.p.py = g.p.y - g.vy;
+    this.grab = null;
+  }
+
+  tearAt(x, y, radius) {
+    for (const b of this.bodies) b.tear(x, y, radius);
+  }
+
+  togglePin(x, y) {
+    const p = this.pick(x, y, 24);
+    if (p) { p.pinned = !p.pinned; p.px = p.x; p.py = p.y; }
+    return p;
+  }
+}
+
+/* Distance of point (px,py) to segment ab -- used for tearing. */
+function distToSegment(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
 /* ------------------------------------------------------------------ *
@@ -124,23 +216,20 @@ class Cloth extends Body {
     this.cols = cols; this.rows = rows; this.spacing = spacing;
     this.stiffness = 1;
     this.links = [];
-    for (let y = 0; y < rows; y++) {
-      for (let x = 0; x < cols; x++) {
+    for (let y = 0; y < rows; y++)
+      for (let x = 0; x < cols; x++)
         this.particles.push(new Particle(ox + x * spacing, oy + y * spacing, y === 0));
-      }
-    }
+
     const at = (x, y) => this.particles[y * cols + x];
-    for (let y = 0; y < rows; y++) {
+    for (let y = 0; y < rows; y++)
       for (let x = 0; x < cols; x++) {
         if (x < cols - 1) this.link(at(x, y), at(x + 1, y));
         if (y < rows - 1) this.link(at(x, y), at(x, y + 1));
       }
-    }
   }
 
   link(a, b) {
-    const dx = b.x - a.x, dy = b.y - a.y;
-    this.links.push({ a, b, rest: Math.hypot(dx, dy), dead: false });
+    this.links.push({ a, b, rest: Math.hypot(b.x - a.x, b.y - a.y), dead: false });
   }
 
   satisfyConstraints(world) {
@@ -157,6 +246,13 @@ class Cloth extends Body {
     }
   }
 
+  tear(x, y, radius) {
+    for (const L of this.links) {
+      if (L.dead) continue;
+      if (distToSegment(x, y, L.a.x, L.a.y, L.b.x, L.b.y) < radius) L.dead = true;
+    }
+  }
+
   draw(ctx) {
     ctx.lineWidth = 1;
     ctx.strokeStyle = "#8d97a6";
@@ -169,9 +265,8 @@ class Cloth extends Body {
     ctx.stroke();
 
     ctx.fillStyle = "#e6ebf2";
-    for (const p of this.particles) {
+    for (const p of this.particles)
       if (p.pinned) ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
-    }
   }
 }
 
@@ -180,6 +275,7 @@ class Cloth extends Body {
  * ------------------------------------------------------------------ */
 
 const canvas = document.getElementById("view");
+const legend = document.getElementById("legend");
 let DPR = Math.min(window.devicePixelRatio || 1, 2);
 const world = new World(canvas);
 
@@ -193,13 +289,61 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-function buildCloth() {
+function reset() {
+  world.clear();
   const cols = 40, rows = 30, spacing = 14;
-  const ox = (window.innerWidth - (cols - 1) * spacing) / 2;
-  const oy = 60;
-  return new Cloth(cols, rows, spacing, ox, oy);
+  const ox = (world.width - (cols - 1) * spacing) / 2;
+  world.add(new Cloth(cols, rows, spacing, ox, 60));
 }
-world.add(buildCloth());
+reset();
+
+/* --- input ------------------------------------------------------- */
+
+const TEAR_RADIUS = 12;
+let tearing = false;
+
+function mousePos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+
+canvas.addEventListener("pointerdown", e => {
+  const m = mousePos(e);
+  world.mouse = m;
+  canvas.setPointerCapture(e.pointerId);
+  if (e.button === 2) { tearing = true; world.tearAt(m.x, m.y, TEAR_RADIUS); }
+  else if (e.button === 0) world.startDrag(m.x, m.y);
+});
+
+canvas.addEventListener("pointermove", e => {
+  const m = mousePos(e);
+  world.mouse = m;
+  if (tearing) world.tearAt(m.x, m.y, TEAR_RADIUS);
+});
+
+function endPointer(e) {
+  tearing = false;
+  world.endDrag();
+  if (e && e.pointerId != null && canvas.hasPointerCapture(e.pointerId))
+    canvas.releasePointerCapture(e.pointerId);
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+window.addEventListener("blur", () => endPointer(null));
+
+window.addEventListener("keydown", e => {
+  if (e.target !== document.body) return;   // never steal keys from inputs
+  switch (e.key.toLowerCase()) {
+    case "r": reset(); break;
+    case "g": world.gravityOn = !world.gravityOn; break;
+    case "w": world.windOn = !world.windOn; break;
+    case "p": world.togglePin(world.mouse.x, world.mouse.y); break;
+  }
+});
+
+/* --- loop -------------------------------------------------------- */
 
 let last = performance.now();
 function frame(now) {
@@ -207,6 +351,10 @@ function frame(now) {
   last = now;
   world.update(dt);
   world.draw();
+  legend.innerHTML =
+    "drag <b>left</b> · tear <b>right</b> · pin <b>P</b> · gravity <b>G</b> " +
+    (world.gravityOn ? "on" : "off") +
+    " · wind <b>W</b> " + (world.windOn ? "on" : "off") + " · reset <b>R</b>";
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
