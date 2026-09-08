@@ -22,6 +22,8 @@
                              background: transparent; }
   #panel label.check { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; cursor: pointer; }
   #panel label.check input { accent-color: #aab4c4; margin: 0; }
+  #panel select { background: #14181d; color: #aab4c4; border: 1px solid #272d36;
+                  font: inherit; padding: 1px 3px; }
   #panel .stats { margin-top: 9px; padding-top: 8px; border-top: 1px solid #272d36; }
   #panel .stats div { display: flex; justify-content: space-between; }
   #panel .stats b { color: #aab4c4; font-weight: normal; font-variant-numeric: tabular-nums; }
@@ -31,6 +33,15 @@
 <canvas id="view"></canvas>
 <div id="panel">
   <h1>Playground</h1>
+  <div class="row" style="margin-bottom:7px"><span>scene</span>
+    <select id="i-scene">
+      <option value="cloth">cloth</option>
+      <option value="rope">ropes</option>
+      <option value="blob">blob</option>
+      <option value="circles">circles</option>
+      <option value="mixed">mixed</option>
+    </select>
+  </div>
   <div class="row"><span>gravity</span><b id="v-gravity"></b></div>
   <input type="range" id="i-gravity" min="0" max="2000" step="10">
   <div class="row"><span>wind</span><b id="v-wind"></b></div>
@@ -92,6 +103,7 @@ class World {
     this.damping = 0.995;        // velocity retained per step
     this.iterations = 8;         // relaxation passes per step
     this.stiffness = 1;          // 0..1, how hard constraints are enforced
+    this.margin = 28;            // walls, inset from the canvas edge
     this.accumulator = 0;
     this.time = 0;
     this.grab = null;            // { p, wasPinned, vx, vy }
@@ -163,7 +175,7 @@ class World {
   }
 
   constrainToBounds() {
-    const w = this.width, h = this.height, m = 2;
+    const m = this.margin, w = this.width, h = this.height;
     this.eachParticle(p => {
       if (p.x < m) p.x = m; else if (p.x > w - m) p.x = w - m;
       if (p.y < m) p.y = m; else if (p.y > h - m) p.y = h - m;
@@ -199,6 +211,12 @@ class World {
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.fillStyle = "#0e1013";
     ctx.fillRect(0, 0, this.width, this.height);
+
+    const m = this.margin;
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#232932";
+    ctx.strokeRect(m + 0.5, m + 0.5, this.width - 2 * m - 1, this.height - 2 * m - 1);
+
     for (const b of this.bodies) b.draw(ctx, this);
     if (this.grab) {
       ctx.strokeStyle = "#e6ebf2";
@@ -237,6 +255,44 @@ class World {
   }
 }
 
+/* --- helpers shared by any body built from distance constraints ---- */
+
+function makeLink(a, b, rest) {
+  return { a, b, rest: rest !== undefined ? rest : Math.hypot(b.x - a.x, b.y - a.y), dead: false };
+}
+
+/* One relaxation pass over a list of links: push each pair back towards
+   its rest length, splitting the correction between the two ends. */
+function solveLinks(links, k) {
+  for (const L of links) {
+    if (L.dead) continue;
+    const a = L.a, b = L.b;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.hypot(dx, dy) || 1e-6;
+    const diff = ((d - L.rest) / d) * 0.5 * k;
+    const ox = dx * diff, oy = dy * diff;
+    if (!a.pinned) { a.x += ox; a.y += oy; }
+    if (!b.pinned) { b.x -= ox; b.y -= oy; }
+  }
+}
+
+function tearLinks(links, x, y, radius) {
+  for (const L of links)
+    if (!L.dead && distToSegment(x, y, L.a.x, L.a.y, L.b.x, L.b.y) < radius) L.dead = true;
+}
+
+function strokeLinks(ctx, links, color) {
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+  for (const L of links) {
+    if (L.dead) continue;
+    ctx.moveTo(L.a.x, L.a.y);
+    ctx.lineTo(L.b.x, L.b.y);
+  }
+  ctx.stroke();
+}
+
 /* Distance of point (px,py) to segment ab -- used for tearing. */
 function distToSegment(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
@@ -267,46 +323,185 @@ class Cloth extends Body {
       }
   }
 
-  link(a, b) {
-    this.links.push({ a, b, rest: Math.hypot(b.x - a.x, b.y - a.y), dead: false });
+  link(a, b) { this.links.push(makeLink(a, b)); }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#8d97a6");
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Rope -- a chain of particles, hung from its first point.
+ * ------------------------------------------------------------------ */
+
+class Rope extends Body {
+  constructor(x, y, segments, spacing, opts = {}) {
+    super();
+    this.links = [];
+    const last = segments - 1;
+    for (let i = 0; i < segments; i++)
+      this.particles.push(new Particle(
+        x + i * spacing, y,
+        (i === 0 && opts.pinFirst !== false) || (i === last && opts.pinLast === true)));
+    for (let i = 0; i < segments - 1; i++)
+      this.links.push(makeLink(this.particles[i], this.particles[i + 1]));
+  }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#9aa4b3");
+    ctx.fillStyle = "#5d6675";
+    for (const p of this.particles) ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Blob -- a closed ring of particles held out by gas pressure.
+ * The ring links stop it stretching; the pressure term compares the
+ * polygon's current signed area to its rest area and pushes every
+ * vertex along its outward normal until the two agree.
+ * ------------------------------------------------------------------ */
+
+class Blob extends Body {
+  constructor(cx, cy, radius, count) {
+    super();
+    this.links = [];
+    this.pressure = 0.9;
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2;
+      this.particles.push(new Particle(cx + Math.cos(a) * radius, cy + Math.sin(a) * radius));
+    }
+    for (let i = 0; i < count; i++)
+      this.links.push(makeLink(this.particles[i], this.particles[(i + 1) % count]));
+    this.restArea = Math.abs(this.area());
+  }
+
+  area() {
+    const ps = this.particles;
+    let a = 0;
+    for (let i = 0, n = ps.length; i < n; i++) {
+      const p = ps[i], q = ps[(i + 1) % n];
+      a += p.x * q.y - q.x * p.y;
+    }
+    return a * 0.5;
   }
 
   satisfyConstraints(world) {
-    const k = world.stiffness;
-    for (const L of this.links) {
-      if (L.dead) continue;
-      const a = L.a, b = L.b;
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const d = Math.hypot(dx, dy) || 1e-6;
-      const diff = ((d - L.rest) / d) * 0.5 * k;
-      const ox = dx * diff, oy = dy * diff;
-      if (!a.pinned) { a.x += ox; a.y += oy; }
-      if (!b.pinned) { b.x -= ox; b.y -= oy; }
+    solveLinks(this.links, world.stiffness);
+
+    const ps = this.particles, n = ps.length;
+    const signed = this.area();
+    const sign = signed < 0 ? -1 : 1;            // keeps normals outward
+
+    // Moving the whole ring outward by h changes the enclosed area by
+    // about perimeter * h, so that is exactly the offset to ask for.
+    let perimeter = 0;
+    for (let i = 0; i < n; i++) {
+      const p = ps[i], q = ps[(i + 1) % n];
+      perimeter += Math.hypot(q.x - p.x, q.y - p.y);
+    }
+    if (perimeter < 1e-6) return;
+
+    const deficit = this.restArea - Math.abs(signed);
+    const h = Math.max(-6, Math.min(6, (deficit / perimeter) * this.pressure));
+
+    for (let i = 0; i < n; i++) {
+      const p = ps[i];
+      if (p.pinned) continue;
+      const prev = ps[(i - 1 + n) % n], next = ps[(i + 1) % n];
+      const dx = next.x - prev.x, dy = next.y - prev.y;
+      const len = Math.hypot(dx, dy) || 1e-6;
+      p.x += (dy / len) * sign * h;              // outward vertex normal
+      p.y += (-dx / len) * sign * h;
     }
   }
 
-  tear(x, y, radius) {
-    for (const L of this.links) {
-      if (L.dead) continue;
-      if (distToSegment(x, y, L.a.x, L.a.y, L.b.x, L.b.y) < radius) L.dead = true;
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#9aa4b3");
+    ctx.fillStyle = "#5d6675";
+    for (const p of this.particles) ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Circles -- a box of colliding discs. No links at all: the constraint
+ * it satisfies is simply "no two discs overlap, and none leaves the box".
+ * ------------------------------------------------------------------ */
+
+class Circles extends Body {
+  constructor(count, box) {
+    super();
+    this.box = box;                              // { x, y, w, h }
+    this.radii = [];
+    for (let i = 0; i < count; i++) {
+      const r = 8 + Math.random() * 14;
+      this.radii.push(r);
+      this.particles.push(new Particle(
+        box.x + r + Math.random() * (box.w - 2 * r),
+        box.y + r + Math.random() * (box.h * 0.6)));
+    }
+  }
+
+  satisfyConstraints(world) {
+    const ps = this.particles, r = this.radii, n = ps.length;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = ps[i], b = ps[j], min = r[i] + r[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 >= min * min) continue;
+        if (d2 < 1e-9) { dx = (i - j) * 0.01; dy = 0.01; d2 = dx * dx + dy * dy; }
+        const d = Math.sqrt(d2);
+        const off = (min - d) / d * 0.5;
+        const ox = dx * off, oy = dy * off;
+        if (!a.pinned) { a.x -= ox; a.y -= oy; }
+        if (!b.pinned) { b.x += ox; b.y += oy; }
+      }
+    }
+    const bx = this.box;
+    for (let i = 0; i < n; i++) {
+      const p = ps[i], rad = r[i];
+      if (p.x < bx.x + rad) p.x = bx.x + rad;
+      if (p.x > bx.x + bx.w - rad) p.x = bx.x + bx.w - rad;
+      if (p.y < bx.y + rad) p.y = bx.y + rad;
+      if (p.y > bx.y + bx.h - rad) p.y = bx.y + bx.h - rad;
     }
   }
 
   draw(ctx) {
+    const bx = this.box;
     ctx.lineWidth = 1;
-    ctx.strokeStyle = "#8d97a6";
+    ctx.strokeStyle = "#333b46";
+    ctx.strokeRect(bx.x + 0.5, bx.y + 0.5, bx.w, bx.h);
+
+    ctx.strokeStyle = "#9aa4b3";
     ctx.beginPath();
-    for (const L of this.links) {
-      if (L.dead) continue;
-      ctx.moveTo(L.a.x, L.a.y);
-      ctx.lineTo(L.b.x, L.b.y);
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i], rad = this.radii[i];
+      ctx.moveTo(p.x + rad, p.y);
+      ctx.arc(p.x, p.y, rad, 0, Math.PI * 2);
     }
     ctx.stroke();
-
-    ctx.fillStyle = "#e6ebf2";
-    for (const p of this.particles)
-      if (p.pinned) ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+    drawPins(ctx, this.particles);
   }
+}
+
+function drawPins(ctx, particles) {
+  ctx.fillStyle = "#e6ebf2";
+  for (const p of particles)
+    if (p.pinned) ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
 }
 
 /* ------------------------------------------------------------------ *
@@ -328,11 +523,60 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
+/* --- scenes ------------------------------------------------------ *
+ * Each scene is just a function returning bodies. Adding a body type
+ * means writing the class and listing it here; the world does the rest.
+ * ------------------------------------------------------------------ */
+
+const SCENES = {
+  cloth: w => {
+    const cols = 40, rows = 30;
+    // Keep the grid at 40x30 but shrink the spacing so it fits the window.
+    const spacing = Math.min(14,
+      (w.width - 2 * w.margin - 40) / (cols - 1),
+      (w.height * 0.62) / (rows - 1));
+    return [new Cloth(cols, rows, spacing,
+                      (w.width - (cols - 1) * spacing) / 2, w.margin + 32)];
+  },
+  rope: w => {
+    const out = [];
+    const span = Math.min(560, w.width - 300), left = (w.width - span) / 2 - 40;
+    // three catenaries of increasing slack, strung between two pins...
+    for (let i = 0; i < 3; i++) {
+      const n = 40 + i * 14;
+      out.push(new Rope(left, 90 + i * 34, n, span / (n - 1), { pinLast: true }));
+    }
+    // ...and one hanging free from a single pin, clear of the others.
+    out.push(new Rope(w.margin + 60, 90, 60, 7));
+    return out;
+  },
+  blob: w => [
+    new Blob(w.width * 0.5, w.height * 0.30, 110, 48),
+    new Blob(w.width * 0.5 - 210, w.height * 0.22, 70, 32),
+  ],
+  circles: w => {
+    const bw = Math.min(760, w.width - 120), bh = Math.min(520, w.height - 120);
+    return [new Circles(70, { x: (w.width - bw) / 2, y: (w.height - bh) / 2, w: bw, h: bh })];
+  },
+  mixed: w => [
+    new Cloth(20, 16, 13, 60, 60),
+    new Rope(w.width * 0.5 - 40, 80, 55, 9),
+    new Blob(w.width * 0.5, w.height * 0.6, 80, 36),
+    new Circles(24, { x: w.width - 340, y: w.height - 300, w: 300, h: 260 }),
+  ],
+};
+
+let scene = "cloth";
+
 function reset() {
   world.clear();
-  const cols = 40, rows = 30, spacing = 14;
-  const ox = (world.width - (cols - 1) * spacing) / 2;
-  world.add(new Cloth(cols, rows, spacing, ox, 60));
+  for (const body of SCENES[scene](world)) world.add(body);
+}
+
+function setScene(name) {
+  if (!SCENES[name]) return;
+  scene = name;
+  reset();
 }
 reset();
 
@@ -383,6 +627,11 @@ window.addEventListener("keydown", e => {
     case "g": world.gravityOn = !world.gravityOn; break;
     case "w": world.windOn = !world.windOn; break;
     case "p": world.togglePin(world.mouse.x, world.mouse.y); break;
+    default: {
+      const names = Object.keys(SCENES);
+      const i = "12345".indexOf(e.key);
+      if (i >= 0 && names[i]) setScene(names[i]);
+    }
   }
 });
 
@@ -411,7 +660,12 @@ function bindCheck(inputId, get, set) {
   return () => { input.checked = get(); };
 }
 
+const sceneSelect = $("i-scene");
+sceneSelect.value = scene;
+sceneSelect.addEventListener("change", () => setScene(sceneSelect.value));
+
 const syncers = [
+  () => { sceneSelect.value = scene; },
   bindRange("i-gravity", () => world.gravity, v => world.gravity = v, v => v.toFixed(0)),
   bindRange("i-wind", () => world.wind, v => world.wind = v, v => v.toFixed(0)),
   bindRange("i-stiff", () => world.stiffness, v => world.stiffness = v, v => v.toFixed(2)),
@@ -445,7 +699,8 @@ function frame(now) {
   legend.innerHTML =
     "drag <b>left</b> · tear <b>right</b> · pin <b>P</b> · gravity <b>G</b> " +
     (world.gravityOn ? "on" : "off") +
-    " · wind <b>W</b> " + (world.windOn ? "on" : "off") + " · reset <b>R</b>";
+    " · wind <b>W</b> " + (world.windOn ? "on" : "off") +
+    " · reset <b>R</b> · scenes <b>1-5</b>";
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
