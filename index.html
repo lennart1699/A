@@ -11,10 +11,42 @@
   canvas { display: block; }
   #legend { position: fixed; left: 14px; bottom: 12px; white-space: pre; pointer-events: none; }
   #legend b { color: #aab4c4; font-weight: normal; }
+
+  #panel { position: fixed; top: 12px; right: 12px; width: 208px; padding: 10px 12px 11px;
+           background: rgba(16, 19, 23, 0.72); border: 1px solid #272d36; color: #7c8698; }
+  #panel h1 { margin: 0 0 8px; font-size: 11px; font-weight: normal; letter-spacing: .12em;
+              text-transform: uppercase; color: #aab4c4; }
+  #panel .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px; }
+  #panel .row span { color: #aab4c4; }
+  #panel input[type=range] { width: 100%; height: 14px; margin: 0 0 7px; accent-color: #aab4c4;
+                             background: transparent; }
+  #panel label.check { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; cursor: pointer; }
+  #panel label.check input { accent-color: #aab4c4; margin: 0; }
+  #panel .stats { margin-top: 9px; padding-top: 8px; border-top: 1px solid #272d36; }
+  #panel .stats div { display: flex; justify-content: space-between; }
+  #panel .stats b { color: #aab4c4; font-weight: normal; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <canvas id="view"></canvas>
+<div id="panel">
+  <h1>Playground</h1>
+  <div class="row"><span>gravity</span><b id="v-gravity"></b></div>
+  <input type="range" id="i-gravity" min="0" max="2000" step="10">
+  <div class="row"><span>wind</span><b id="v-wind"></b></div>
+  <input type="range" id="i-wind" min="0" max="2000" step="10">
+  <div class="row"><span>stiffness</span><b id="v-stiff"></b></div>
+  <input type="range" id="i-stiff" min="0.05" max="1" step="0.05">
+  <div class="row"><span>iterations</span><b id="v-iter"></b></div>
+  <input type="range" id="i-iter" min="1" max="20" step="1">
+  <label class="check"><input type="checkbox" id="i-gravity-on">gravity on <span style="color:#5d6675">(G)</span></label>
+  <label class="check"><input type="checkbox" id="i-wind-on">wind on <span style="color:#5d6675">(W)</span></label>
+  <div class="stats">
+    <div><span>fps</span><b id="v-fps">--</b></div>
+    <div><span>particles</span><b id="v-count">--</b></div>
+    <div><span>constraints</span><b id="v-links">--</b></div>
+  </div>
+</div>
 <div id="legend"></div>
 <script>
 "use strict";
@@ -59,6 +91,7 @@ class World {
     this.windOn = false;
     this.damping = 0.995;        // velocity retained per step
     this.iterations = 8;         // relaxation passes per step
+    this.stiffness = 1;          // 0..1, how hard constraints are enforced
     this.accumulator = 0;
     this.time = 0;
     this.grab = null;            // { p, wasPinned, vx, vy }
@@ -78,6 +111,13 @@ class World {
   particleCount() {
     let n = 0;
     for (const b of this.bodies) n += b.particles.length;
+    return n;
+  }
+
+  linkCount() {
+    let n = 0;
+    for (const b of this.bodies)
+      if (b.links) for (const L of b.links) if (!L.dead) n++;
     return n;
   }
 
@@ -214,7 +254,6 @@ class Cloth extends Body {
   constructor(cols, rows, spacing, ox, oy) {
     super();
     this.cols = cols; this.rows = rows; this.spacing = spacing;
-    this.stiffness = 1;
     this.links = [];
     for (let y = 0; y < rows; y++)
       for (let x = 0; x < cols; x++)
@@ -233,7 +272,7 @@ class Cloth extends Body {
   }
 
   satisfyConstraints(world) {
-    const k = this.stiffness;
+    const k = world.stiffness;
     for (const L of this.links) {
       if (L.dead) continue;
       const a = L.a, b = L.b;
@@ -334,7 +373,11 @@ canvas.addEventListener("pointercancel", endPointer);
 window.addEventListener("blur", () => endPointer(null));
 
 window.addEventListener("keydown", e => {
-  if (e.target !== document.body) return;   // never steal keys from inputs
+  const t = e.target;
+  // Sliders and checkboxes keep their own arrow-key behaviour; only text
+  // fields would actually swallow letters, so that is all we skip.
+  if (t && (t.tagName === "TEXTAREA" ||
+           (t.tagName === "INPUT" && !/^(range|checkbox)$/.test(t.type)))) return;
   switch (e.key.toLowerCase()) {
     case "r": reset(); break;
     case "g": world.gravityOn = !world.gravityOn; break;
@@ -343,14 +386,62 @@ window.addEventListener("keydown", e => {
   }
 });
 
+/* --- control panel ----------------------------------------------- *
+ * Each control is a plain input bound to one world field; syncPanel()
+ * pushes state back the other way so the keyboard shortcuts stay honest.
+ * ------------------------------------------------------------------ */
+
+const $ = id => document.getElementById(id);
+
+function bindRange(inputId, get, set, format) {
+  const input = $(inputId), out = $(inputId.replace("i-", "v-"));
+  input.value = get();
+  out.textContent = format(get());
+  input.addEventListener("input", () => {
+    set(parseFloat(input.value));
+    out.textContent = format(get());
+  });
+  return () => { input.value = get(); out.textContent = format(get()); };
+}
+
+function bindCheck(inputId, get, set) {
+  const input = $(inputId);
+  input.checked = get();
+  input.addEventListener("change", () => set(input.checked));
+  return () => { input.checked = get(); };
+}
+
+const syncers = [
+  bindRange("i-gravity", () => world.gravity, v => world.gravity = v, v => v.toFixed(0)),
+  bindRange("i-wind", () => world.wind, v => world.wind = v, v => v.toFixed(0)),
+  bindRange("i-stiff", () => world.stiffness, v => world.stiffness = v, v => v.toFixed(2)),
+  bindRange("i-iter", () => world.iterations, v => world.iterations = v, v => v.toFixed(0)),
+  bindCheck("i-gravity-on", () => world.gravityOn, v => world.gravityOn = v),
+  bindCheck("i-wind-on", () => world.windOn, v => world.windOn = v),
+];
+const syncPanel = () => syncers.forEach(fn => fn());
+
 /* --- loop -------------------------------------------------------- */
 
 let last = performance.now();
+let fps = 60, statsAt = 0;
+
 function frame(now) {
   const dt = (now - last) / 1000;
   last = now;
+  if (dt > 0) fps += ((1 / dt) - fps) * 0.1;   // smoothed, not jittery
+
   world.update(dt);
   world.draw();
+
+  if (now - statsAt > 250) {                   // DOM writes don't need 60Hz
+    statsAt = now;
+    $("v-fps").textContent = Math.round(fps);
+    $("v-count").textContent = world.particleCount();
+    $("v-links").textContent = world.linkCount();
+    syncPanel();
+  }
+
   legend.innerHTML =
     "drag <b>left</b> · tear <b>right</b> · pin <b>P</b> · gravity <b>G</b> " +
     (world.gravityOn ? "on" : "off") +
