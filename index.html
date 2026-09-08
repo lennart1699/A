@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Physics Playground</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1013; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Core: Verlet point masses + distance constraints.
+ * A body owns its particles and knows two things only:
+ *   satisfyConstraints()  -- called ITERATIONS times per fixed step
+ *   draw(ctx)             -- called once per rendered frame
+ * ------------------------------------------------------------------ */
+
+class Particle {
+  constructor(x, y, pinned = false) {
+    this.x = x; this.y = y;      // current position
+    this.px = x; this.py = y;    // previous position (velocity is implicit)
+    this.ax = 0; this.ay = 0;    // accumulated acceleration for this step
+    this.pinned = pinned;
+  }
+}
+
+class Body {
+  constructor() { this.particles = []; }
+  satisfyConstraints(world) {}
+  draw(ctx, world) {}
+}
+
+const DT = 1 / 60;               // fixed simulation timestep
+const MAX_STEPS = 5;             // catch-up cap so we never spiral
+
+class World {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.bodies = [];
+    this.gravity = 900;          // px / s^2
+    this.wind = 0;               // px / s^2, +x
+    this.damping = 0.995;        // velocity retained per step
+    this.iterations = 8;         // relaxation passes per step
+    this.accumulator = 0;
+    this.time = 0;
+  }
+
+  add(body) { this.bodies.push(body); return body; }
+
+  eachParticle(fn) {
+    for (const b of this.bodies) for (const p of b.particles) fn(p, b);
+  }
+
+  accumulateForces() {
+    const gx = this.wind * (0.6 + 0.4 * Math.sin(this.time * 1.7));
+    this.eachParticle(p => { p.ax = gx; p.ay = this.gravity; });
+  }
+
+  integrate() {
+    const d = this.damping, dt2 = DT * DT;
+    this.eachParticle(p => {
+      if (p.pinned) { p.px = p.x; p.py = p.y; return; }
+      const vx = (p.x - p.px) * d + p.ax * dt2;
+      const vy = (p.y - p.py) * d + p.ay * dt2;
+      p.px = p.x; p.py = p.y;
+      p.x += vx; p.y += vy;
+    });
+  }
+
+  constrainToBounds() {
+    const w = this.canvas.width / DPR, h = this.canvas.height / DPR, m = 2;
+    this.eachParticle(p => {
+      if (p.x < m) p.x = m; else if (p.x > w - m) p.x = w - m;
+      if (p.y < m) p.y = m; else if (p.y > h - m) p.y = h - m;
+    });
+  }
+
+  step() {
+    this.time += DT;
+    this.accumulateForces();
+    this.integrate();
+    for (let i = 0; i < this.iterations; i++) {
+      for (const b of this.bodies) b.satisfyConstraints(this);
+    }
+    this.constrainToBounds();
+  }
+
+  // Fixed timestep with an accumulator: the sim runs at 60Hz regardless
+  // of how fast or slow the display refreshes.
+  update(frameSeconds) {
+    this.accumulator += Math.min(frameSeconds, 0.25);
+    let steps = 0;
+    while (this.accumulator >= DT && steps < MAX_STEPS) {
+      this.step();
+      this.accumulator -= DT;
+      steps++;
+    }
+    if (steps === MAX_STEPS) this.accumulator = 0;
+  }
+
+  draw() {
+    const ctx = this.ctx;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = "#0e1013";
+    ctx.fillRect(0, 0, this.canvas.width / DPR, this.canvas.height / DPR);
+    for (const b of this.bodies) b.draw(ctx, this);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Cloth
+ * ------------------------------------------------------------------ */
+
+class Cloth extends Body {
+  constructor(cols, rows, spacing, ox, oy) {
+    super();
+    this.cols = cols; this.rows = rows; this.spacing = spacing;
+    this.stiffness = 1;
+    this.links = [];
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        this.particles.push(new Particle(ox + x * spacing, oy + y * spacing, y === 0));
+      }
+    }
+    const at = (x, y) => this.particles[y * cols + x];
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        if (x < cols - 1) this.link(at(x, y), at(x + 1, y));
+        if (y < rows - 1) this.link(at(x, y), at(x, y + 1));
+      }
+    }
+  }
+
+  link(a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    this.links.push({ a, b, rest: Math.hypot(dx, dy), dead: false });
+  }
+
+  satisfyConstraints(world) {
+    const k = this.stiffness;
+    for (const L of this.links) {
+      if (L.dead) continue;
+      const a = L.a, b = L.b;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.hypot(dx, dy) || 1e-6;
+      const diff = ((d - L.rest) / d) * 0.5 * k;
+      const ox = dx * diff, oy = dy * diff;
+      if (!a.pinned) { a.x += ox; a.y += oy; }
+      if (!b.pinned) { b.x -= ox; b.y -= oy; }
+    }
+  }
+
+  draw(ctx) {
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#8d97a6";
+    ctx.beginPath();
+    for (const L of this.links) {
+      if (L.dead) continue;
+      ctx.moveTo(L.a.x, L.a.y);
+      ctx.lineTo(L.b.x, L.b.y);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = "#e6ebf2";
+    for (const p of this.particles) {
+      if (p.pinned) ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Boot
+ * ------------------------------------------------------------------ */
+
+const canvas = document.getElementById("view");
+let DPR = Math.min(window.devicePixelRatio || 1, 2);
+const world = new World(canvas);
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(window.innerWidth * DPR);
+  canvas.height = Math.floor(window.innerHeight * DPR);
+  canvas.style.width = window.innerWidth + "px";
+  canvas.style.height = window.innerHeight + "px";
+}
+window.addEventListener("resize", resize);
+resize();
+
+function buildCloth() {
+  const cols = 40, rows = 30, spacing = 14;
+  const ox = (window.innerWidth - (cols - 1) * spacing) / 2;
+  const oy = 60;
+  return new Cloth(cols, rows, spacing, ox, oy);
+}
+world.add(buildCloth());
+
+let last = performance.now();
+function frame(now) {
+  const dt = (now - last) / 1000;
+  last = now;
+  world.update(dt);
+  world.draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__world = world; // handy for poking from the console
+</script>
+</body>
+</html>
