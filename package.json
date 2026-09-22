@@ -1,0 +1,12 @@
+{
+  "name": "physics-playground-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Development-only test harness. index.html ships with zero dependencies.",
+  "scripts": {
+    "test": "node tests/run.js"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

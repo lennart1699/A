@@ -106,6 +106,7 @@ class World {
     this.margin = 28;            // walls, inset from the canvas edge
     this.accumulator = 0;
     this.time = 0;
+    this.paused = false;      // render loop only; step() ignores it
     this.grab = null;            // { p, wasPinned, vx, vy }
     this.mouse = { x: 0, y: 0 };
   }
@@ -195,7 +196,10 @@ class World {
 
   // Fixed timestep with an accumulator: the sim always advances in 1/60s
   // slices no matter how fast or slow the display refreshes.
+  // `paused` stops the render loop driving the sim; step() stays
+  // unconditional so a test can advance it deterministically.
   update(frameSeconds) {
+    if (this.paused) return;
     this.accumulator += Math.min(frameSeconds, 0.25);
     let steps = 0;
     while (this.accumulator >= DT && steps < MAX_STEPS) {
