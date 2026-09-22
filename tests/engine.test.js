@@ -282,3 +282,127 @@ test("friction is exposed on the panel and drives the world", async () => {
     assert(v.label.indexOf("0.6") === 0, `readout should show the value, got "${v.label}"`);
   });
 });
+
+/* ---------------------------------------------------------------- *
+ * Task 5 -- the five reviewed bugs.
+ * ---------------------------------------------------------------- */
+
+test("bug 1: a particle with no live links is still drawn", async () => {
+  await withPage(async page => {
+    const seen = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true;
+      setScene("cloth");
+      const body = w.bodies[0];
+      // Orphan one interior particle by killing every link that touches it.
+      const victim = body.particles[15 * 40 + 20];
+      for (const L of body.links) if (L.a === victim || L.b === victim) L.dead = true;
+      victim.x = 550; victim.y = 400;
+      w.draw();
+      const ctx = w.ctx, dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const px = ctx.getImageData((550 - 3) * dpr, (400 - 3) * dpr, 7 * dpr, 7 * dpr).data;
+      // Background is #0e1013; anything brighter means something was drawn.
+      let bright = 0;
+      for (let i = 0; i < px.length; i += 4) if (px[i] > 40) bright++;
+      return bright;
+    });
+    assert(seen > 0, "an orphaned particle rendered nothing, so it cannot be seen to be grabbed");
+  });
+});
+
+test("bug 2: a pin toggled during a drag survives release", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true;
+      setScene("cloth");
+      const p = w.bodies[0].particles[10 * 40 + 20];   // free interior point
+      const wasPinned = p.pinned;
+      w.mouse = { x: p.x, y: p.y };
+      w.startDrag(p.x, p.y);
+      w.togglePin(p.x, p.y);          // user presses P mid-drag
+      const during = p.pinned;
+      w.endDrag();
+      return { wasPinned, during, after: p.pinned };
+    });
+    assert(r.wasPinned === false, "test picked an already-pinned particle");
+    assert(r.after === true, "pin toggled during the drag was reverted on release");
+  });
+});
+
+test("bug 3: the right button tears while the left is dragging", async () => {
+  await withPage(async page => {
+    // Correction to the original report: a second button pressed during an
+    // active drag fires no pointerdown and no pointerup at all (pointerup
+    // arrives only when the last button lifts), so right-click never killed
+    // the drag. The real defect is that tearing during a drag was impossible.
+    await page.evaluate(() => { window.__world.paused = true; setScene("cloth"); });
+    const target = await page.evaluate(() => {
+      const p = window.__world.bodies[0].particles[10 * 40 + 20];
+      return { x: Math.round(p.x), y: Math.round(p.y) };
+    });
+    const before = await page.evaluate(() => window.__world.linkCount());
+    await page.mouse.move(target.x, target.y);
+    await page.mouse.down();
+    const grabbed = await page.evaluate(() => !!window.__world.grab);
+    await page.mouse.down({ button: "right" });
+    for (let i = 0; i < 8; i++) await page.mouse.move(target.x + i * 10, target.y + i * 4);
+    const during = await page.evaluate(() => ({
+      grab: !!window.__world.grab, links: window.__world.linkCount(),
+    }));
+    await page.mouse.up({ button: "right" });
+    await page.mouse.up();
+    assert(grabbed, "left drag never started, so the test proves nothing");
+    assert(during.grab, "the left drag was lost while tearing");
+    assert(during.links < before,
+      `tearing during a drag cut nothing: ${before} links before, ${during.links} during`);
+  });
+});
+
+test("bug 4: the cursor position stays live over the panel", async () => {
+  await withPage(async page => {
+    await page.evaluate(() => { window.__world.paused = true; });
+    await page.mouse.move(400, 400);
+    await page.mouse.move(980, 120);               // over the panel
+    const m = await page.evaluate(() => ({ x: window.__world.mouse.x, y: window.__world.mouse.y }));
+    assertClose(m.x, 980, 2, "mouse x went stale over the panel");
+    assertClose(m.y, 120, 2, "mouse y went stale over the panel");
+  });
+});
+
+test("bug 5: a frame needing exactly MAX_STEPS keeps its banked remainder", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = false;
+      w.accumulator = 0;
+      // 5 steps' worth of time plus a half-step that must survive.
+      w.update(5 / 60 + (1 / 120));
+      const afterExact = w.accumulator;
+      w.accumulator = 0;
+      w.update(0.24);            // a genuine overrun: backlog should be dropped
+      return { afterExact, afterOverrun: w.accumulator };
+    });
+    assertClose(r.afterExact, 1 / 120, 1e-9,
+      "a frame that fit within MAX_STEPS discarded its banked remainder");
+    assertClose(r.afterOverrun, 0, 1e-12,
+      "a real overrun should drop its backlog rather than spiral");
+  });
+});
+
+test("a fully torn blob does not explode on its own pressure", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true;
+      setScene("blob");
+      const blob = w.bodies[0];
+      for (const L of blob.links) L.dead = true;      // cut the ring entirely
+      for (let i = 0; i < 120; i++) w.step();
+      const out = [];
+      for (const p of blob.particles) out.push(p.x, p.y);
+      return out;
+    });
+    assertFinite(r, "a fully torn blob produced a non-finite position");
+  });
+});

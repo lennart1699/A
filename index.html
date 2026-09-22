@@ -225,7 +225,10 @@ class World {
       this.accumulator -= DT;
       steps++;
     }
-    if (steps === MAX_STEPS) this.accumulator = 0;  // drop the backlog
+    // Drop the backlog only when the cap actually cut us short. A frame that
+    // fit inside MAX_STEPS has legitimate sub-step time banked; discarding it
+    // silently loses up to a frame of simulation.
+    if (steps === MAX_STEPS && this.accumulator >= DT) this.accumulator = 0;
   }
 
   draw() {
@@ -273,11 +276,16 @@ class World {
   togglePin(x, y) {
     const p = this.pick(x, y, 24);
     if (p) {
-      p.invMass = p.invMass === 0 ? (p.baseInvMass || 1) : 0;
-      // A pin toggled mid-drag must survive the release, so update the
-      // value endDrag will restore rather than letting it overwrite us.
-      if (this.grab && this.grab.p === p) this.grab.wasInvMass = p.invMass;
-      p.px = p.x; p.py = p.y;
+      if (this.grab && this.grab.p === p) {
+        // A grabbed particle is already held at invMass 0 by the drag, so
+        // toggle what it returns to rather than the transient state -- else
+        // pressing P mid-drag reads as "unpin" and is undone on release.
+        const g = this.grab;
+        g.wasInvMass = g.wasInvMass === 0 ? (p.baseInvMass || 1) : 0;
+      } else {
+        p.invMass = p.invMass === 0 ? (p.baseInvMass || 1) : 0;
+        p.px = p.x; p.py = p.y;
+      }
     }
     return p;
   }
@@ -376,6 +384,7 @@ class Cloth extends Body {
 
   draw(ctx) {
     strokeLinks(ctx, this.links, "#8d97a6");
+    drawOrphans(ctx, this.particles, this.links);
     drawPins(ctx, this.particles);
   }
 }
@@ -549,6 +558,21 @@ function drawPins(ctx, particles) {
     if (p.pinned) ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
 }
 
+/* A particle whose links have all been torn draws nothing, yet it still
+   falls and can still be grabbed. Mark the ones that survive on a link and
+   give the rest a dot, so nothing on screen is invisible but interactive. */
+function drawOrphans(ctx, particles, links) {
+  const attached = new Set();
+  for (const L of links) {
+    if (L.dead) continue;
+    attached.add(L.a); attached.add(L.b);
+  }
+  if (attached.size === particles.length) return;
+  ctx.fillStyle = "#8d97a6";
+  for (const p of particles)
+    if (!attached.has(p) && !p.pinned) ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+}
+
 /* ------------------------------------------------------------------ *
  * Boot
  * ------------------------------------------------------------------ */
@@ -645,13 +669,18 @@ canvas.addEventListener("pointerdown", e => {
   else if (e.button === 0) world.startDrag(m.x, m.y);
 });
 
-canvas.addEventListener("pointermove", e => {
+// Listen on the window, not the canvas: over the panel the canvas sees no
+// move events at all, which left world.mouse stale for the P shortcut.
+window.addEventListener("pointermove", e => {
   const m = mousePos(e);
   world.mouse = m;
-  if (tearing) world.tearAt(m.x, m.y, TEAR_RADIUS);
+  // A second button pressed during a drag fires no pointerdown, so the only
+  // live signal that the right button is held is `buttons` on the move.
+  if (tearing || (e.buttons & 2)) world.tearAt(m.x, m.y, TEAR_RADIUS);
 });
 
 function endPointer(e) {
+  // pointerup only arrives once the last button lifts, so this ends both.
   tearing = false;
   world.endDrag();
   if (e && e.pointerId != null && canvas.hasPointerCapture(e.pointerId))
