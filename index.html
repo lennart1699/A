@@ -48,6 +48,8 @@
   <input type="range" id="i-wind" min="0" max="2000" step="10">
   <div class="row"><span>stiffness</span><b id="v-stiff"></b></div>
   <input type="range" id="i-stiff" min="0.05" max="1" step="0.05">
+  <div class="row"><span>friction</span><b id="v-friction"></b></div>
+  <input type="range" id="i-friction" min="0" max="1" step="0.05">
   <div class="row"><span>iterations</span><b id="v-iter"></b></div>
   <input type="range" id="i-iter" min="1" max="20" step="1">
   <label class="check"><input type="checkbox" id="i-gravity-on">gravity on <span style="color:#5d6675">(G)</span></label>
@@ -108,6 +110,7 @@ class World {
     this.damping = 0.995;        // velocity retained per step
     this.iterations = 8;         // relaxation passes per step
     this.stiffness = 1;          // 0..1, how hard constraints are enforced
+    this.friction = 0.2;         // 0..1, tangential velocity lost on contact
     this.margin = 28;            // walls, inset from the canvas edge
     this.accumulator = 0;
     this.time = 0;
@@ -180,11 +183,21 @@ class World {
     g.vx = dx; g.vy = dy;
   }
 
+  // Clamp to the walls, and bleed the velocity running along each wall we
+  // touch. Verlet keeps velocity implicit in (x - px), so shedding a fraction
+  // f of it means walking the previous position that fraction closer to the
+  // current one. Without this a wheel slides instead of rolling.
   constrainToBounds() {
-    const m = this.margin, w = this.width, h = this.height;
+    const m = this.margin, w = this.width, h = this.height, f = this.friction;
     this.eachParticle(p => {
-      if (p.x < m) p.x = m; else if (p.x > w - m) p.x = w - m;
-      if (p.y < m) p.y = m; else if (p.y > h - m) p.y = h - m;
+      let hitV = false, hitH = false;
+      if (p.x < m) { p.x = m; hitV = true; }
+      else if (p.x > w - m) { p.x = w - m; hitV = true; }
+      if (p.y < m) { p.y = m; hitH = true; }
+      else if (p.y > h - m) { p.y = h - m; hitH = true; }
+      if (f <= 0) return;
+      if (hitH) p.px += (p.x - p.px) * f;   // floor or ceiling: bleed x
+      if (hitV) p.py += (p.y - p.py) * f;   // side wall: bleed y
     });
   }
 
@@ -701,6 +714,7 @@ const syncers = [
   bindRange("i-gravity", () => world.gravity, v => world.gravity = v, v => v.toFixed(0)),
   bindRange("i-wind", () => world.wind, v => world.wind = v, v => v.toFixed(0)),
   bindRange("i-stiff", () => world.stiffness, v => world.stiffness = v, v => v.toFixed(2)),
+  bindRange("i-friction", () => world.friction, v => world.friction = v, v => v.toFixed(2)),
   bindRange("i-iter", () => world.iterations, v => world.iterations = v, v => v.toFixed(0)),
   bindCheck("i-gravity-on", () => world.gravityOn, v => world.gravityOn = v),
   bindCheck("i-wind-on", () => world.windOn, v => world.windOn = v),

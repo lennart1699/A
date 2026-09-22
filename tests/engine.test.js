@@ -216,3 +216,69 @@ test("an inverted range settles instead of oscillating", async () => {
       `inverted range is still oscillating: separation moved ${r.drift} in one more pass`);
   });
 });
+
+/* ---------------------------------------------------------------- *
+ * Task 4 -- wall friction.
+ * ---------------------------------------------------------------- */
+
+// A single particle sliding along the floor. Returns its horizontal speed
+// (which in Verlet is just x - px) after n steps.
+async function slideOnFloor(page, friction, steps) {
+  return page.evaluate(({ friction, steps }) => {
+    const w = window.__world;
+    w.paused = true; w.clear();
+    w.gravityOn = true; w.windOn = false;
+    w.friction = friction;
+    const p = new Particle(300, w.height - w.margin);
+    p.px = p.x - 8;                      // moving right at 8px/step
+    const body = new Body();
+    body.particles.push(p);
+    w.add(body);
+    for (let i = 0; i < steps; i++) w.step();
+    return { vx: p.x - p.px, x: p.x, y: p.y };
+  }, { friction, steps });
+}
+
+test("friction bleeds tangential speed on floor contact", async () => {
+  await withPage(async page => {
+    // Measured against a frictionless slide, not against the initial speed:
+    // global damping alone drops 8 to ~7.24 over 20 steps, so comparing with
+    // the starting value would pass even with no friction implemented.
+    const free = await slideOnFloor(page, 0, 20);
+    const held = await slideOnFloor(page, 0.2, 20);
+    assertFinite([held.vx, held.x, held.y], "friction produced a non-finite value");
+    assert(held.vx > 0, `particle should still be moving right, got vx ${held.vx}`);
+    assert(held.vx < free.vx * 0.5,
+      `friction should cost far more than damping: ${held.vx} vs frictionless ${free.vx}`);
+  });
+});
+
+test("friction 0 preserves tangential speed", async () => {
+  await withPage(async page => {
+    const r = await slideOnFloor(page, 0, 20);
+    // Only the global damping applies: 8 * 0.995^20 with no friction loss.
+    assertClose(r.vx, 8 * Math.pow(0.995, 20), 1e-6,
+      "frictionless slide should lose only the global damping");
+  });
+});
+
+test("friction 1 stops a slide without reversing it", async () => {
+  await withPage(async page => {
+    const r = await slideOnFloor(page, 1, 20);
+    assertFinite([r.vx], "full friction produced a non-finite velocity");
+    assert(r.vx >= 0, `full friction reversed the particle: vx ${r.vx}`);
+    assertClose(r.vx, 0, 1e-9, "full friction should bring the slide to rest");
+  });
+});
+
+test("friction is exposed on the panel and drives the world", async () => {
+  await withPage(async page => {
+    await page.locator("#i-friction").fill("0.65");
+    const v = await page.evaluate(() => ({
+      world: window.__world.friction,
+      label: document.getElementById("v-friction").textContent,
+    }));
+    assertClose(v.world, 0.65, 1e-9, "slider should drive world.friction");
+    assert(v.label.indexOf("0.6") === 0, `readout should show the value, got "${v.label}"`);
+  });
+});
