@@ -136,3 +136,83 @@ test("pin toggling restores the particle's own mass, not a default", async () =>
     assertClose(r.restored, 0.25, 1e-12, "unpinning should restore the original mass");
   });
 });
+
+/* ---------------------------------------------------------------- *
+ * Task 3 -- a rigid link is a range whose ends coincide.
+ * ---------------------------------------------------------------- */
+
+// Two particles pulled apart by gravity, joined by one constraint.
+// Returns the separation once the solver has settled.
+async function settleJoint(page, make, steps = 400) {
+  return page.evaluate(({ make, steps }) => {
+    const w = window.__world;
+    w.paused = true; w.clear();
+    w.gravityOn = true; w.windOn = false;
+    const a = new Particle(500, 200, true);       // anchor
+    const b = new Particle(500, 260);             // hangs below
+    const body = new Body();
+    body.particles.push(a, b);
+    // eslint-disable-next-line no-new-func
+    body.links = [new Function("a", "b", "return " + make)(a, b)];
+    body.satisfyConstraints = wd => solveLinks(body.links, wd.stiffness);
+    w.add(body);
+    for (let i = 0; i < steps; i++) w.step();
+    return { sep: Math.hypot(b.x - a.x, b.y - a.y), bx: b.x, by: b.y };
+  }, { make, steps });
+}
+
+test("a rigid link still converges to its rest length", async () => {
+  await withPage(async page => {
+    const r = await settleJoint(page, "makeLink(a, b, 60)");
+    assertFinite([r.bx, r.by], "rigid link produced a non-finite position");
+    assertClose(r.sep, 60, 1.0, "rigid link separation under gravity");
+  });
+});
+
+test("a range link lets the joint travel between min and max", async () => {
+  await withPage(async page => {
+    // Gravity pulls the free end down; the range should stop it at max.
+    const r = await settleJoint(page, "makeRange(a, b, 40, 90)");
+    assert(r.sep <= 90 + 1.0, `separation ${r.sep} exceeded max 90`);
+    assert(r.sep >= 40 - 1.0, `separation ${r.sep} fell below min 40`);
+    assertClose(r.sep, 90, 1.0, "gravity should drive the joint to its max");
+  });
+});
+
+test("a range link does not correct while inside its range", async () => {
+  await withPage(async page => {
+    const moved = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; w.clear(); w.gravityOn = false;
+      const a = new Particle(400, 300), b = new Particle(460, 300);  // 60 apart
+      const links = [makeRange(a, b, 40, 90)];                       // inside
+      const ax = a.x, bx = b.x;
+      solveLinks(links, 1);
+      return { a: a.x - ax, b: b.x - bx };
+    });
+    assertClose(moved.a, 0, 0, "left end moved while inside the range");
+    assertClose(moved.b, 0, 0, "right end moved while inside the range");
+  });
+});
+
+test("an inverted range settles instead of oscillating", async () => {
+  await withPage(async page => {
+    // min > max is a caller error; it must not diverge or produce NaN.
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; w.clear(); w.gravityOn = false;
+      const a = new Particle(400, 300), b = new Particle(470, 300);
+      const links = [makeRange(a, b, 90, 40)];   // inverted on purpose
+      for (let i = 0; i < 200; i++) solveLinks(links, 1);
+      const settled = Math.hypot(b.x - a.x, b.y - a.y);
+      solveLinks(links, 1);
+      const after = Math.hypot(b.x - a.x, b.y - a.y);
+      return { ax: a.x, ay: a.y, bx: b.x, by: b.y,
+               sep: settled, drift: Math.abs(after - settled) };
+    });
+    assertFinite([r.ax, r.ay, r.bx, r.by], "inverted range produced a non-finite position");
+    assert(r.sep < 1e4, `inverted range diverged to separation ${r.sep}`);
+    assert(r.drift < 1e-9,
+      `inverted range is still oscillating: separation moved ${r.drift} in one more pass`);
+  });
+});

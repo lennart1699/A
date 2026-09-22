@@ -272,12 +272,23 @@ class World {
 
 /* --- helpers shared by any body built from distance constraints ---- */
 
+// A link is a range constraint. A rigid one is the degenerate case where
+// both ends of the range coincide, so one record and one solver serve both.
 function makeLink(a, b, rest) {
-  return { a, b, rest: rest !== undefined ? rest : Math.hypot(b.x - a.x, b.y - a.y), dead: false };
+  const r = rest !== undefined ? rest : Math.hypot(b.x - a.x, b.y - a.y);
+  return { a, b, min: r, max: r, dead: false };
+}
+
+// A joint that may travel freely between two lengths -- used for limb limits,
+// where a fixed length would lock the joint and no limit would let it fold
+// back through itself. An inverted range is a caller error; normalise it so
+// the solver converges rather than flipping between the two bounds forever.
+function makeRange(a, b, min, max) {
+  return { a, b, min: Math.min(min, max), max: Math.max(min, max), dead: false };
 }
 
 /* One relaxation pass over a list of links: push each pair back towards
-   its rest length, sharing the correction in proportion to inverse mass
+   its allowed length, sharing the correction in proportion to inverse mass
    so the lighter end travels further. With both ends at invMass 1 this
    reduces to an even split, which is what the pre-mass solver did. */
 function solveLinks(links, k) {
@@ -288,7 +299,9 @@ function solveLinks(links, k) {
     if (wSum === 0) continue;              // nothing here can move
     const dx = b.x - a.x, dy = b.y - a.y;
     const d = Math.hypot(dx, dy) || 1e-6;
-    const scale = ((d - L.rest) / d) * k / wSum;
+    const target = d < L.min ? L.min : (d > L.max ? L.max : d);
+    if (target === d) continue;            // already inside the allowed range
+    const scale = ((d - target) / d) * k / wSum;
     const ox = dx * scale, oy = dy * scale;
     a.x += ox * a.invMass; a.y += oy * a.invMass;
     b.x -= ox * b.invMass; b.y -= oy * b.invMass;
