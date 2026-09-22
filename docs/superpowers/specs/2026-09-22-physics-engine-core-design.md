@@ -226,6 +226,32 @@ recording that.
 - Cloth holds 60fps at 20 iterations.
 - `index.html` opens by double-click with no network access and no build step.
 
+## Found during implementation
+
+Two things the design did not anticipate, both recorded here because the
+spec is the document a future reader will trust.
+
+**Pinned links were under-relaxed.** The behaviour-preservation claim in
+Section 1 was wrong and the golden test caught it; see the correction there.
+
+**A pressurised body resting on a floor propels itself.** Pressure applied
+once per relaxation pass compounds against the wall clamp, and a resting
+jelly walked 255px sideways under vertical gravity alone. Applying pressure
+once per step and subtracting its net translation brings that to 3px, and
+`satisfyConstraints(world, iter)` now receives the pass index so a body can
+tell a mid-solve pass from the last.
+
+The blob is not fully fixed. A pure pressure ring on a high-friction floor
+still ratchets: ~290px over 900 steps at friction 0.2, against ~100px before
+friction existed. Each step leaves a small tangential impulse that friction
+grips instead of letting slide back. A real fix needs velocity-level contact
+resolution rather than position clamping, which is a larger change than this
+pass and is not attempted here.
+
+**Per-body damping.** The global 0.995 retains 74% of velocity per second,
+which settles cloth nicely and killed the pendulum in about three seconds.
+`integrate()` now honours `body.damping` when a body sets one.
+
 ## Out of scope
 
 - **Inter-body collision** (cloth vs. circles). Bodies never see each other
