@@ -39,6 +39,12 @@
       <option value="rope">ropes</option>
       <option value="blob">blob</option>
       <option value="circles">circles</option>
+      <option value="ragdoll">ragdolls</option>
+      <option value="wheel">wheels</option>
+      <option value="spring">springs</option>
+      <option value="bridge">bridge</option>
+      <option value="jelly">jelly</option>
+      <option value="pendulum">pendulums</option>
       <option value="mixed">mixed</option>
     </select>
   </div>
@@ -90,7 +96,10 @@ class Particle {
 
 class Body {
   constructor() { this.particles = []; }
-  satisfyConstraints(world) {}
+  // `iter` is the relaxation pass index, 0 .. world.iterations-1. Most bodies
+  // ignore it; a body applying a whole-shape force uses it to act once per
+  // step rather than once per pass.
+  satisfyConstraints(world, iter) {}
   draw(ctx, world) {}
   tear(x, y, radius) {}          // optional: right-drag cutting
 }
@@ -160,9 +169,12 @@ class World {
   }
 
   integrate() {
-    const d = this.damping, dt2 = DT * DT;
-    this.eachParticle(p => {
+    const dt2 = DT * DT;
+    this.eachParticle((p, body) => {
       if (p.invMass === 0) { p.px = p.x; p.py = p.y; return; }
+      // A body may damp differently from the world: the global value settles
+      // cloth nicely but kills a pendulum in about three seconds.
+      const d = body.damping !== undefined ? body.damping : this.damping;
       const vx = (p.x - p.px) * d + p.ax * dt2;
       const vy = (p.y - p.py) * d + p.ay * dt2;
       p.px = p.x; p.py = p.y;
@@ -207,7 +219,7 @@ class World {
     this.integrate();
     this.followCursor();
     for (let i = 0; i < this.iterations; i++) {
-      for (const b of this.bodies) b.satisfyConstraints(this);
+      for (const b of this.bodies) b.satisfyConstraints(this, i);
     }
     this.constrainToBounds();
   }
@@ -346,6 +358,58 @@ function strokeLinks(ctx, links, color) {
   ctx.stroke();
 }
 
+/* Restore a closed ring towards its rest area by pushing every vertex along
+   its outward normal. Moving the whole ring out by h changes the enclosed
+   area by about perimeter * h, so that is the offset to ask for.
+
+   Pressure is an internal force, so it must not translate the body. Two
+   things here keep it from doing so: the mean displacement is subtracted,
+   and callers apply this once per step rather than once per relaxation pass
+   (repeating it compounds against the wall clamp). Together those took the
+   jelly's sideways travel from 255px to 9px over 900 steps.
+
+   KNOWN LIMITATION: a pure pressure ring resting on a high-friction floor
+   still ratchets. The blob travels ~290px over 900 steps at friction 0.2,
+   against ~100px before friction existed: each step's residual pressure
+   asymmetry is a small tangential impulse, which friction converts into grip
+   instead of letting it slide back. Fixing it properly needs velocity-level
+   contact resolution rather than position clamping, which is a larger change
+   than this pass. Drop friction toward 0 to see the blob hold still. */
+function solvePressure(ring, restArea, signedArea, pressure) {
+  const n = ring.length;
+  if (n < 3) return;
+  let perimeter = 0;
+  for (let i = 0; i < n; i++) {
+    const p = ring[i], q = ring[(i + 1) % n];
+    perimeter += Math.hypot(q.x - p.x, q.y - p.y);
+  }
+  if (perimeter < 1e-6) return;
+
+  const sign = signedArea < 0 ? -1 : 1;
+  const h = Math.max(-6, Math.min(6,
+    ((restArea - Math.abs(signedArea)) / perimeter) * pressure));
+  if (h === 0) return;
+
+  const dx = new Array(n), dy = new Array(n);
+  let mx = 0, my = 0, free = 0;
+  for (let i = 0; i < n; i++) {
+    const prev = ring[(i - 1 + n) % n], next = ring[(i + 1) % n];
+    const ex = next.x - prev.x, ey = next.y - prev.y;
+    const len = Math.hypot(ex, ey) || 1e-6;
+    if (ring[i].invMass === 0) { dx[i] = 0; dy[i] = 0; continue; }
+    dx[i] = (ey / len) * sign * h;
+    dy[i] = (-ex / len) * sign * h;
+    mx += dx[i]; my += dy[i]; free++;
+  }
+  if (free === 0) return;
+  mx /= free; my /= free;
+  for (let i = 0; i < n; i++) {
+    if (dx[i] === 0 && dy[i] === 0) continue;
+    ring[i].x += dx[i] - mx;
+    ring[i].y += dy[i] - my;
+  }
+}
+
 /* Distance of point (px,py) to segment ab -- used for tearing. */
 function distToSegment(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
@@ -449,34 +513,12 @@ class Blob extends Body {
     return a * 0.5;
   }
 
-  satisfyConstraints(world) {
+  satisfyConstraints(world, iter) {
     solveLinks(this.links, world.stiffness);
-
-    const ps = this.particles, n = ps.length;
-    const signed = this.area();
-    const sign = signed < 0 ? -1 : 1;            // keeps normals outward
-
-    // Moving the whole ring outward by h changes the enclosed area by
-    // about perimeter * h, so that is exactly the offset to ask for.
-    let perimeter = 0;
-    for (let i = 0; i < n; i++) {
-      const p = ps[i], q = ps[(i + 1) % n];
-      perimeter += Math.hypot(q.x - p.x, q.y - p.y);
-    }
-    if (perimeter < 1e-6) return;
-
-    const deficit = this.restArea - Math.abs(signed);
-    const h = Math.max(-6, Math.min(6, (deficit / perimeter) * this.pressure));
-
-    for (let i = 0; i < n; i++) {
-      const p = ps[i];
-      if (p.invMass === 0) continue;
-      const prev = ps[(i - 1 + n) % n], next = ps[(i + 1) % n];
-      const dx = next.x - prev.x, dy = next.y - prev.y;
-      const len = Math.hypot(dx, dy) || 1e-6;
-      p.x += (dy / len) * sign * h;              // outward vertex normal
-      p.y += (-dx / len) * sign * h;
-    }
+    // Once per step, not once per relaxation pass: repeating it compounds
+    // against the wall clamp and drives the body sideways.
+    if (iter === world.iterations - 1)
+      solvePressure(this.particles, this.restArea, this.area(), this.pressure);
   }
 
   tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
@@ -548,6 +590,362 @@ class Circles extends Body {
       ctx.arc(p.x, p.y, rad, 0, Math.PI * 2);
     }
     ctx.stroke();
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Ragdoll -- limbs held by rigid bones, with a range constraint spanning
+ * each joint. A bone fixes a length; the span across two bones bounds the
+ * angle between them, which is what stops an elbow folding through itself.
+ * ------------------------------------------------------------------ */
+
+class Ragdoll extends Body {
+  constructor(cx, cy, scale = 1) {
+    super();
+    this.links = [];
+    const S = scale;
+    const P = (x, y, invMass) => {
+      const p = new Particle(cx + x * S, cy + y * S, false, invMass);
+      this.particles.push(p);
+      return p;
+    };
+    // Heavier through the middle, lighter at the extremities.
+    this.head     = P(0, -46, 0.9);
+    this.neck     = P(0, -30, 0.5);
+    this.pelvis   = P(0,  10, 0.35);
+    this.shoulderL = P(-16, -24, 0.7);
+    this.shoulderR = P( 16, -24, 0.7);
+    this.elbowL   = P(-30,  -4, 1.2);
+    this.elbowR   = P( 30,  -4, 1.2);
+    this.handL    = P(-38,  20, 1.6);
+    this.handR    = P( 38,  20, 1.6);
+    this.hipL     = P(-12,  14, 0.6);
+    this.hipR     = P( 12,  14, 0.6);
+    this.kneeL    = P(-16,  46, 1.0);
+    this.kneeR    = P( 16,  46, 1.0);
+    this.footL    = P(-18,  76, 1.4);
+    this.footR    = P( 18,  76, 1.4);
+
+    const bone = (a, b) => this.links.push(makeLink(a, b));
+    bone(this.head, this.neck);
+    bone(this.neck, this.shoulderL); bone(this.neck, this.shoulderR);
+    bone(this.shoulderL, this.shoulderR);
+    bone(this.shoulderL, this.elbowL); bone(this.elbowL, this.handL);
+    bone(this.shoulderR, this.elbowR); bone(this.elbowR, this.handR);
+    bone(this.neck, this.pelvis);
+    bone(this.pelvis, this.hipL); bone(this.pelvis, this.hipR);
+    bone(this.hipL, this.hipR);
+    bone(this.hipL, this.kneeL); bone(this.kneeL, this.footL);
+    bone(this.hipR, this.kneeR); bone(this.kneeR, this.footR);
+    // Torso bracing so the trunk does not shear flat.
+    bone(this.shoulderL, this.pelvis); bone(this.shoulderR, this.pelvis);
+
+    // Joint limits: the span from shoulder to hand may neither collapse
+    // (elbow folded shut) nor reach the straight-arm length exactly.
+    const joint = (a, b, minFrac, maxFrac) => {
+      const straight = Math.hypot(b.x - a.x, b.y - a.y);
+      this.joints = this.joints || [];
+      const L = makeRange(a, b, straight * minFrac, straight * maxFrac);
+      this.links.push(L);
+      this.joints.push(L);
+    };
+    joint(this.shoulderL, this.handL, 0.45, 0.98);
+    joint(this.shoulderR, this.handR, 0.45, 0.98);
+    joint(this.hipL, this.footL, 0.55, 0.98);
+    joint(this.hipR, this.footR, 0.55, 0.98);
+    joint(this.head, this.pelvis, 0.80, 1.0);
+  }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#9aa4b3");
+    ctx.strokeStyle = "#e6ebf2";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const r = Math.hypot(this.head.x - this.neck.x, this.head.y - this.neck.y) * 0.55;
+    ctx.moveTo(this.head.x + r, this.head.y);
+    ctx.arc(this.head.x, this.head.y, r, 0, Math.PI * 2);
+    ctx.stroke();
+    drawOrphans(ctx, this.particles, this.links);
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Wheel -- a braced rim around a hub. Spokes fix the radius, rim links
+ * fix the circumference, and chords across the rim stop it shearing into
+ * an ellipse. Friction at the floor turns a shove into a roll.
+ * ------------------------------------------------------------------ */
+
+class Wheel extends Body {
+  constructor(cx, cy, radius, spokes = 18) {
+    super();
+    this.links = [];
+    this.radius = radius;
+    this.hub = new Particle(cx, cy, false, 0.6);
+    this.particles.push(this.hub);
+    this.rim = [];
+    for (let i = 0; i < spokes; i++) {
+      const a = (i / spokes) * Math.PI * 2;
+      const p = new Particle(cx + Math.cos(a) * radius, cy + Math.sin(a) * radius);
+      this.rim.push(p);
+      this.particles.push(p);
+    }
+    for (let i = 0; i < spokes; i++) {
+      this.links.push(makeLink(this.hub, this.rim[i]));
+      this.links.push(makeLink(this.rim[i], this.rim[(i + 1) % spokes]));
+      // Chord bracing: without it the rim folds instead of rolling.
+      this.links.push(makeLink(this.rim[i], this.rim[(i + (spokes >> 2)) % spokes]));
+    }
+    this.markIndex = 0;
+  }
+
+  // Angle of one tracked rim point about the hub, used to tell a roll from
+  // a slide: a sliding wheel translates without this changing.
+  spinAngle() {
+    const p = this.rim[this.markIndex];
+    return Math.atan2(p.y - this.hub.y, p.x - this.hub.x);
+  }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#79838f");
+    ctx.strokeStyle = "#e6ebf2";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < this.rim.length; i++) {
+      const p = this.rim[i];
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    // A single spoke drawn bright, so rotation is visible at a glance.
+    ctx.beginPath();
+    ctx.moveTo(this.hub.x, this.hub.y);
+    ctx.lineTo(this.rim[this.markIndex].x, this.rim[this.markIndex].y);
+    ctx.stroke();
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Spring -- a chain whose segments may travel between a compressed and an
+ * extended length, so it visibly stretches under load where a rope holds
+ * its length. Drawn as a coil rather than a line.
+ * ------------------------------------------------------------------ */
+
+class Spring extends Body {
+  constructor(x, y, coils, segment, stretch = 2.2) {
+    super();
+    this.links = [];
+    this.isSpring = true;
+    this.naturalLength = segment * (coils - 1);
+    for (let i = 0; i < coils; i++)
+      this.particles.push(new Particle(x, y + i * segment, i === 0));
+    for (let i = 0; i < coils - 1; i++)
+      this.links.push(makeRange(this.particles[i], this.particles[i + 1],
+                                segment * 0.35, segment * stretch));
+  }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    ctx.strokeStyle = "#9aa4b3";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const ps = this.particles;
+    ctx.moveTo(ps[0].x, ps[0].y);
+    // Several zig-zags per segment at a fixed amplitude. Scaling the
+    // amplitude by segment length made an extended spring collapse into a
+    // near-straight line, which read as a wire rather than a coil.
+    const AMP = 6, ZIGS = 4;
+    for (let i = 1; i < ps.length; i++) {
+      const a = ps[i - 1], b = ps[i];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1e-6;
+      const nx = -dy / len, ny = dx / len;
+      for (let j = 1; j <= ZIGS; j++) {
+        const t = j / ZIGS;
+        const off = j === ZIGS ? 0 : (j % 2 ? AMP : -AMP);
+        ctx.lineTo(a.x + dx * t + nx * off, a.y + dy * t + ny * off);
+      }
+    }
+    ctx.stroke();
+    drawOrphans(ctx, this.particles, this.links);
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Bridge -- a plank deck slung between two anchors, with hangers to a
+ * catenary cable above. Load anywhere on the deck spreads through the
+ * cable, which is the whole point of the shape.
+ * ------------------------------------------------------------------ */
+
+class Bridge extends Body {
+  constructor(x, y, span, planks) {
+    super();
+    this.links = [];
+    this.deck = [];
+    this.cable = [];
+    const step = span / (planks - 1);
+    for (let i = 0; i < planks; i++) {
+      const pinned = i === 0 || i === planks - 1;
+      const d = new Particle(x + i * step, y + 70, pinned);
+      this.deck.push(d);
+      this.particles.push(d);
+    }
+    for (let i = 0; i < planks; i++) {
+      const pinned = i === 0 || i === planks - 1;
+      // Cable starts sagging so it settles into a catenary rather than
+      // snapping taut on the first step.
+      const t = i / (planks - 1);
+      const sag = Math.sin(t * Math.PI) * 34;
+      const c = new Particle(x + i * step, y + sag, pinned, 0.8);
+      this.cable.push(c);
+      this.particles.push(c);
+    }
+    for (let i = 0; i < planks - 1; i++) {
+      this.links.push(makeLink(this.deck[i], this.deck[i + 1]));
+      this.links.push(makeLink(this.cable[i], this.cable[i + 1]));
+    }
+    for (let i = 0; i < planks; i++)
+      this.links.push(makeLink(this.cable[i], this.deck[i]));
+  }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#79838f");
+    ctx.strokeStyle = "#e6ebf2";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < this.deck.length; i++) {
+      const p = this.deck[i];
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    drawOrphans(ctx, this.particles, this.links);
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Jelly -- a filled grid with shear bracing and a pressure term, so it
+ * wobbles and recovers where the cloth would simply fold.
+ * ------------------------------------------------------------------ */
+
+class Jelly extends Body {
+  constructor(cx, cy, cols, rows, spacing) {
+    super();
+    this.links = [];
+    this.cols = cols; this.rows = rows;
+    this.pressure = 0.7;
+    const ox = cx - ((cols - 1) * spacing) / 2;
+    const oy = cy - ((rows - 1) * spacing) / 2;
+    for (let y = 0; y < rows; y++)
+      for (let x = 0; x < cols; x++)
+        this.particles.push(new Particle(ox + x * spacing, oy + y * spacing));
+    const at = (x, y) => this.particles[y * cols + x];
+    for (let y = 0; y < rows; y++)
+      for (let x = 0; x < cols; x++) {
+        if (x < cols - 1) this.links.push(makeLink(at(x, y), at(x + 1, y)));
+        if (y < rows - 1) this.links.push(makeLink(at(x, y), at(x, y + 1)));
+        // Diagonals are what make it a solid rather than a cloth.
+        if (x < cols - 1 && y < rows - 1) {
+          this.links.push(makeLink(at(x, y), at(x + 1, y + 1)));
+          this.links.push(makeLink(at(x + 1, y), at(x, y + 1)));
+        }
+      }
+    this.hull = [];
+    for (let x = 0; x < cols; x++) this.hull.push(at(x, 0));
+    for (let y = 1; y < rows; y++) this.hull.push(at(cols - 1, y));
+    for (let x = cols - 2; x >= 0; x--) this.hull.push(at(x, rows - 1));
+    for (let y = rows - 2; y >= 1; y--) this.hull.push(at(0, y));
+    this.restArea = Math.abs(this.area());
+  }
+
+  area() {
+    const ps = this.hull;
+    let a = 0;
+    for (let i = 0, n = ps.length; i < n; i++) {
+      const p = ps[i], q = ps[(i + 1) % n];
+      a += p.x * q.y - q.x * p.y;
+    }
+    return a * 0.5;
+  }
+
+  satisfyConstraints(world, iter) {
+    solveLinks(this.links, world.stiffness);
+    // The braced grid holds the shape; pressure restores the area it loses
+    // on impact. Applied to the outer ring only.
+    if (iter === world.iterations - 1)
+      solvePressure(this.hull, this.restArea, this.area(), this.pressure);
+  }
+
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#5f6874");
+    ctx.strokeStyle = "#e6ebf2";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < this.hull.length; i++) {
+      const p = this.hull[i];
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    drawPins(ctx, this.particles);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Pendulum -- a heavy bob on a stiff arm. A short chain of rigid links
+ * rather than one, so the arm reads as a line and converges quickly.
+ * ------------------------------------------------------------------ */
+
+class Pendulum extends Body {
+  constructor(x, y, length, bobMass = 0.25, segments = 6) {
+    super();
+    this.links = [];
+    // Near-lossless: a pendulum that stops swinging demonstrates nothing.
+    this.damping = 0.9998;
+    const step = length / segments;
+    this.pivot = new Particle(x, y, true);
+    this.particles.push(this.pivot);
+    let prev = this.pivot;
+    for (let i = 1; i <= segments; i++) {
+      // Light arm, heavy bob: the mass model is what makes this swing like
+      // a pendulum rather than a rope.
+      const isBob = i === segments;
+      const p = new Particle(x + i * step, y, false, isBob ? bobMass : 2.5);
+      this.particles.push(p);
+      this.links.push(makeLink(prev, p, step));
+      prev = p;
+    }
+    this.bob = prev;
+  }
+
+  satisfyConstraints(world) { solveLinks(this.links, world.stiffness); }
+  tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
+
+  draw(ctx) {
+    strokeLinks(ctx, this.links, "#9aa4b3");
+    ctx.strokeStyle = "#e6ebf2";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(this.bob.x + 7, this.bob.y);
+    ctx.arc(this.bob.x, this.bob.y, 7, 0, Math.PI * 2);
+    ctx.stroke();
+    drawOrphans(ctx, this.particles, this.links);
     drawPins(ctx, this.particles);
   }
 }
@@ -627,6 +1025,47 @@ const SCENES = {
     const bw = Math.min(760, w.width - 120), bh = Math.min(520, w.height - 120);
     return [new Circles(70, { x: (w.width - bw) / 2, y: (w.height - bh) / 2, w: bw, h: bh })];
   },
+  ragdoll: w => {
+    const out = [];
+    for (let i = 0; i < 3; i++) {
+      const r = new Ragdoll(w.width * 0.5 + (i - 1) * 210, 150, 1.5);
+      r.head.invMass = 0;              // hung by the head, puppet fashion
+      // Give the outer two a shove so they swing rather than hang plumb.
+      if (i !== 1) for (const p of r.particles) p.px = p.x + (i === 0 ? 7 : -7);
+      out.push(r);
+    }
+    return out;
+  },
+  wheel: w => {
+    // Rolling is against the floor: bodies do not yet collide with one
+    // another, so there is deliberately nothing here but wheels and ground.
+    const out = [new Wheel(w.width * 0.5 - 210, w.height * 0.34, 80, 20),
+                 new Wheel(w.width * 0.5 + 40, w.height * 0.26, 54, 16),
+                 new Wheel(w.width * 0.5 + 240, w.height * 0.40, 38, 14)];
+    for (const wheel of out)
+      for (const p of wheel.particles) p.px = p.x - 5;   // set them rolling
+    return out;
+  },
+  spring: w => {
+    const out = [];
+    for (let i = 0; i < 4; i++)
+      out.push(new Spring(w.width * 0.5 - 180 + i * 120, 70, 16, 16, 1.6 + i * 0.5));
+    return out;
+  },
+  bridge: w => {
+    const span = Math.min(560, w.width - 320);
+    return [new Bridge((w.width - span) / 2, w.height * 0.30, span, 26)];
+  },
+  jelly: w => [
+    new Jelly(w.width * 0.5 - 150, w.height * 0.52, 8, 8, 20),
+    new Jelly(w.width * 0.5 + 120, w.height * 0.44, 6, 6, 24),
+  ],
+  pendulum: w => {
+    const out = [];
+    for (let i = 0; i < 3; i++)
+      out.push(new Pendulum(w.width * 0.5 - 170 + i * 170, 90, 150 + i * 30, 0.2, 6));
+    return out;
+  },
   mixed: w => [
     new Cloth(20, 16, 13, 60, 60),
     new Rope(w.width * 0.5 - 40, 80, 55, 9),
@@ -701,9 +1140,17 @@ window.addEventListener("keydown", e => {
     case "g": world.gravityOn = !world.gravityOn; break;
     case "w": world.windOn = !world.windOn; break;
     case "p": world.togglePin(world.mouse.x, world.mouse.y); break;
+    case "[": case "]": {
+      // Eleven scenes outgrew the number row; bracket keys walk the list.
+      const names = Object.keys(SCENES);
+      const at = names.indexOf(scene);
+      const next = (at + (e.key === "]" ? 1 : names.length - 1)) % names.length;
+      setScene(names[next]);
+      break;
+    }
     default: {
       const names = Object.keys(SCENES);
-      const i = "12345".indexOf(e.key);
+      const i = "123456789".indexOf(e.key);
       if (i >= 0 && names[i]) setScene(names[i]);
     }
   }
@@ -775,7 +1222,7 @@ function frame(now) {
     "drag <b>left</b> · tear <b>right</b> · pin <b>P</b> · gravity <b>G</b> " +
     (world.gravityOn ? "on" : "off") +
     " · wind <b>W</b> " + (world.windOn ? "on" : "off") +
-    " · reset <b>R</b> · scenes <b>1-5</b>";
+    " · reset <b>R</b> · scenes <b>1-9</b> <b>[</b> <b>]</b>";
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

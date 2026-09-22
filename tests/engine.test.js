@@ -406,3 +406,207 @@ test("a fully torn blob does not explode on its own pressure", async () => {
     assertFinite(r, "a fully torn blob produced a non-finite position");
   });
 });
+
+/* ---------------------------------------------------------------- *
+ * Task 6 -- the six new body types. Each test pins the invariant that
+ * makes that body what it is, not merely that the class exists.
+ * ---------------------------------------------------------------- */
+
+// setScene silently ignores an unknown name, which would let a test for a
+// body that does not exist yet pass against whatever scene was already up.
+// Assert the switch actually happened.
+async function settleScene(page, name, steps = 400) {
+  const ok = await page.evaluate(({ name, steps }) => {
+    const w = window.__world;
+    w.paused = true;
+    if (!(name in SCENES)) return false;
+    setScene(name);
+    for (let i = 0; i < steps; i++) w.step();
+    return true;
+  }, { name, steps });
+  assert(ok, `scene "${name}" is not registered in SCENES`);
+}
+
+test("every scene runs without producing a non-finite position", async () => {
+  await withPage(async page => {
+    for (const name of ["cloth", "rope", "blob", "circles", "mixed",
+                        "ragdoll", "wheel", "spring", "bridge", "jelly", "pendulum"]) {
+      await settleScene(page, name, 300);
+      const pos = await positions(page);
+      assert(pos.length > 0, `scene "${name}" built no particles`);
+      assertFinite(pos, `scene "${name}" produced a non-finite position`);
+    }
+  });
+});
+
+test("ragdoll joints stay inside their range limits", async () => {
+  await withPage(async page => {
+    const worst = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true;
+      if (!("ragdoll" in SCENES)) return null;
+      setScene("ragdoll");
+      for (let i = 0; i < 500; i++) w.step();
+      let over = 0;
+      for (const b of w.bodies) {
+        for (const L of b.links) {
+          if (L.dead) continue;
+          const d = Math.hypot(L.b.x - L.a.x, L.b.y - L.a.y);
+          over = Math.max(over, d - L.max, L.min - d);
+        }
+      }
+      // A collapsed heap satisfies every range limit, so also check the
+      // figure still stands up: head above pelvis, arms not through the body.
+      const r = w.bodies[0];
+      return {
+        over,
+        headAbovePelvis: r.pelvis.y - r.head.y,
+        span: Math.abs(r.handR.x - r.handL.x),
+      };
+    });
+    assert(worst !== null, "scene \"ragdoll\" is not registered in SCENES");
+    assert(worst.over < 2.0, `a ragdoll constraint is violated by ${worst.over}px`);
+    assert(worst.headAbovePelvis > 30,
+      `ragdoll collapsed: head only ${worst.headAbovePelvis.toFixed(1)}px above the pelvis`);
+    assert(worst.span > 20,
+      `ragdoll arms folded into the torso: hand span ${worst.span.toFixed(1)}px`);
+  });
+});
+
+test("the wheel keeps its hub centred in its rim", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("wheel");
+      for (let i = 0; i < 400; i++) w.step();
+      const wheel = w.bodies.find(b => b.hub);
+      let cx = 0, cy = 0, n = 0;
+      for (const p of wheel.rim) { cx += p.x; cy += p.y; n++; }
+      cx /= n; cy /= n;
+      return { off: Math.hypot(wheel.hub.x - cx, wheel.hub.y - cy), radius: wheel.radius };
+    });
+    assert(r.off < r.radius * 0.25,
+      `hub drifted ${r.off.toFixed(2)}px from the rim centroid (radius ${r.radius})`);
+  });
+});
+
+test("the wheel rolls rather than sliding when pushed", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("wheel");
+      w.friction = 0.35;
+      for (let i = 0; i < 260; i++) w.step();      // let it reach the floor
+      const wheel = w.bodies.find(b => b.hub);
+      const before = { x: wheel.hub.x, a: wheel.spinAngle() };
+      for (const p of wheel.particles) p.px = p.x - 6;   // shove it right
+      for (let i = 0; i < 200; i++) w.step();
+      return { dx: wheel.hub.x - before.x, dTheta: Math.abs(wheel.spinAngle() - before.a) };
+    });
+    assert(r.dx > 5, `wheel barely moved: ${r.dx.toFixed(2)}px`);
+    assert(r.dTheta > 0.15,
+      `wheel slid without rotating: moved ${r.dx.toFixed(1)}px but turned ${r.dTheta.toFixed(3)}rad`);
+  });
+});
+
+test("a spring stretches further than a rigid rope under the same load", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("spring");
+      for (let i = 0; i < 500; i++) w.step();
+      const s = w.bodies.find(b => b.isSpring);
+      const len = Math.hypot(s.particles[s.particles.length - 1].x - s.particles[0].x,
+                             s.particles[s.particles.length - 1].y - s.particles[0].y);
+      return { len, natural: s.naturalLength };
+    });
+    assert(r.len > r.natural * 1.05,
+      `spring did not extend: ${r.len.toFixed(1)} vs natural ${r.natural.toFixed(1)}`);
+  });
+});
+
+test("the bridge deck sags under a load and recovers when it is removed", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("bridge");
+      for (let i = 0; i < 400; i++) w.step();
+      const bridge = w.bodies.find(b => b.deck);
+      const mid = bridge.deck[Math.floor(bridge.deck.length / 2)];
+      const resting = mid.y;
+      const was = mid.invMass;
+      mid.invMass = 0.02;                       // hang something heavy on it
+      for (let i = 0; i < 300; i++) w.step();
+      const loaded = mid.y;
+      mid.invMass = was;
+      for (let i = 0; i < 600; i++) w.step();
+      return { resting, loaded, recovered: mid.y };
+    });
+    assert(r.loaded > r.resting + 2,
+      `deck did not sag: rest ${r.resting.toFixed(1)}, loaded ${r.loaded.toFixed(1)}`);
+    assert(Math.abs(r.recovered - r.resting) < Math.abs(r.loaded - r.resting) * 0.6,
+      `deck did not recover: rest ${r.resting.toFixed(1)}, after ${r.recovered.toFixed(1)}`);
+  });
+});
+
+test("the jelly holds most of its area at rest", async () => {
+  await withPage(async page => {
+    const ratio = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("jelly");
+      for (let i = 0; i < 500; i++) w.step();
+      const j = w.bodies.find(b => b.restArea !== undefined);
+      return Math.abs(j.area()) / j.restArea;
+    });
+    assert(ratio > 0.75, `jelly collapsed to ${(ratio * 100).toFixed(1)}% of its rest area`);
+  });
+});
+
+test("the pendulum swings and loses height only slowly", async () => {
+  await withPage(async page => {
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("pendulum");
+      const p = w.bodies.find(b => b.bob);
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 0; i < 400; i++) { w.step(); lo = Math.min(lo, p.bob.y); hi = Math.max(hi, p.bob.y); }
+      let lo2 = Infinity;
+      for (let i = 0; i < 400; i++) { w.step(); lo2 = Math.min(lo2, p.bob.y); }
+      return { swing: hi - lo, riseFirst: lo, riseLater: lo2 };
+    });
+    assert(r.swing > 20, `pendulum barely moved: vertical travel ${r.swing.toFixed(1)}px`);
+    assert(r.riseLater < r.riseFirst + (r.swing * 0.8),
+      "pendulum lost almost all its height, so it is not swinging freely");
+  });
+});
+
+test("a jelly at rest does not propel itself sideways", async () => {
+  await withPage(async page => {
+    // Regression: pressure applied once per relaxation pass compounded
+    // against the wall clamp and walked the body 255px across the floor.
+    const drift = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("jelly");
+      const j = w.bodies[0];
+      const cx = () => j.particles.reduce((a, p) => a + p.x, 0) / j.particles.length;
+      const x0 = cx();
+      for (let i = 0; i < 900; i++) w.step();
+      return cx() - x0;
+    });
+    assert(Math.abs(drift) < 30,
+      `jelly travelled ${drift.toFixed(1)}px under vertical gravity alone`);
+  });
+});
+
+test("a blob holds its area while resting", async () => {
+  await withPage(async page => {
+    const area = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("blob");
+      const b = w.bodies[0];
+      for (let i = 0; i < 900; i++) w.step();
+      return Math.abs(b.area()) / b.restArea;
+    });
+    assert(area > 0.9, `blob deflated to ${(area * 100).toFixed(1)}% of rest area`);
+  });
+});
