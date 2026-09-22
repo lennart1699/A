@@ -73,12 +73,17 @@
  * ------------------------------------------------------------------ */
 
 class Particle {
-  constructor(x, y, pinned = false) {
+  // Immovability is a mass, not a flag: invMass 0 means nothing can shift
+  // this point. baseInvMass remembers what it weighs when it is let go, so
+  // unpinning a heavy particle gives back its weight rather than a default.
+  constructor(x, y, pinned = false, invMass = 1) {
     this.x = x; this.y = y;      // current position
     this.px = x; this.py = y;    // previous position (velocity is implicit)
     this.ax = 0; this.ay = 0;    // acceleration accumulated for this step
-    this.pinned = pinned;
+    this.baseInvMass = invMass;
+    this.invMass = pinned ? 0 : invMass;
   }
+  get pinned() { return this.invMass === 0; }
 }
 
 class Body {
@@ -154,7 +159,7 @@ class World {
   integrate() {
     const d = this.damping, dt2 = DT * DT;
     this.eachParticle(p => {
-      if (p.pinned) { p.px = p.x; p.py = p.y; return; }
+      if (p.invMass === 0) { p.px = p.x; p.py = p.y; return; }
       const vx = (p.x - p.px) * d + p.ax * dt2;
       const vy = (p.y - p.py) * d + p.ay * dt2;
       p.px = p.x; p.py = p.y;
@@ -234,15 +239,15 @@ class World {
   startDrag(x, y) {
     const p = this.pick(x, y, 30);
     if (!p) return false;
-    this.grab = { p, wasPinned: p.pinned, vx: 0, vy: 0 };
-    p.pinned = true;
+    this.grab = { p, wasInvMass: p.invMass, vx: 0, vy: 0 };
+    p.invMass = 0;
     return true;
   }
 
   endDrag() {
     const g = this.grab;
     if (!g) return;
-    g.p.pinned = g.wasPinned;
+    g.p.invMass = g.wasInvMass;
     g.p.px = g.p.x - g.vx;      // hand back the drag velocity
     g.p.py = g.p.y - g.vy;
     this.grab = null;
@@ -254,7 +259,13 @@ class World {
 
   togglePin(x, y) {
     const p = this.pick(x, y, 24);
-    if (p) { p.pinned = !p.pinned; p.px = p.x; p.py = p.y; }
+    if (p) {
+      p.invMass = p.invMass === 0 ? (p.baseInvMass || 1) : 0;
+      // A pin toggled mid-drag must survive the release, so update the
+      // value endDrag will restore rather than letting it overwrite us.
+      if (this.grab && this.grab.p === p) this.grab.wasInvMass = p.invMass;
+      p.px = p.x; p.py = p.y;
+    }
     return p;
   }
 }
@@ -266,17 +277,21 @@ function makeLink(a, b, rest) {
 }
 
 /* One relaxation pass over a list of links: push each pair back towards
-   its rest length, splitting the correction between the two ends. */
+   its rest length, sharing the correction in proportion to inverse mass
+   so the lighter end travels further. With both ends at invMass 1 this
+   reduces to an even split, which is what the pre-mass solver did. */
 function solveLinks(links, k) {
   for (const L of links) {
     if (L.dead) continue;
     const a = L.a, b = L.b;
+    const wSum = a.invMass + b.invMass;
+    if (wSum === 0) continue;              // nothing here can move
     const dx = b.x - a.x, dy = b.y - a.y;
     const d = Math.hypot(dx, dy) || 1e-6;
-    const diff = ((d - L.rest) / d) * 0.5 * k;
-    const ox = dx * diff, oy = dy * diff;
-    if (!a.pinned) { a.x += ox; a.y += oy; }
-    if (!b.pinned) { b.x -= ox; b.y -= oy; }
+    const scale = ((d - L.rest) / d) * k / wSum;
+    const ox = dx * scale, oy = dy * scale;
+    a.x += ox * a.invMass; a.y += oy * a.invMass;
+    b.x -= ox * b.invMass; b.y -= oy * b.invMass;
   }
 }
 
@@ -420,7 +435,7 @@ class Blob extends Body {
 
     for (let i = 0; i < n; i++) {
       const p = ps[i];
-      if (p.pinned) continue;
+      if (p.invMass === 0) continue;
       const prev = ps[(i - 1 + n) % n], next = ps[(i + 1) % n];
       const dx = next.x - prev.x, dy = next.y - prev.y;
       const len = Math.hypot(dx, dy) || 1e-6;
@@ -470,8 +485,8 @@ class Circles extends Body {
         const d = Math.sqrt(d2);
         const off = (min - d) / d * 0.5;
         const ox = dx * off, oy = dy * off;
-        if (!a.pinned) { a.x -= ox; a.y -= oy; }
-        if (!b.pinned) { b.x += ox; b.y += oy; }
+        if (a.invMass !== 0) { a.x -= ox; a.y -= oy; }
+        if (b.invMass !== 0) { b.x += ox; b.y += oy; }
       }
     }
     const bx = this.box;

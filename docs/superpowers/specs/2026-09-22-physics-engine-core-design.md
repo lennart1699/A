@@ -62,15 +62,32 @@ b.x -= dx * scale * b.invMass;
 b.y -= dy * scale * b.invMass;
 ```
 
-**Behaviour-preservation property.** With `invMass === 1` on both ends,
-`wSum === 2` and `scale` reduces to `((d - target) / d) * k / 2`, which is
-algebraically identical to the current `* 0.5` factor. Every existing scene
-constructs particles at the default mass, so the mass refactor alone must not
-change any existing trajectory. This is asserted by test, not assumed.
+**Behaviour-preservation property — CORRECTED 2026-09-22 after test.**
 
-Pinned particles previously contributed nothing to a correction because they
-were skipped; under the new model they contribute `invMass === 0`, so the whole
-correction goes to the free end. Same outcome, one mechanism instead of two.
+The original claim ("the mass refactor changes no existing trajectory") was
+wrong, and the golden test caught it. The correction below is what actually
+holds.
+
+*For links with two free ends*, the claim is exact. With `invMass === 1` on
+both, `wSum === 2` and `scale` reduces to `((d - target) / d) * k / 2`,
+algebraically identical to the old `* 0.5`. These trajectories are unchanged.
+
+*For links with one immovable end, behaviour deliberately changes.* The old
+solver computed the half-correction and then skipped the pinned end, so a
+pinned link only ever applied **half** its correction to the free end —
+under-relaxing every constraint anchored to a pin. Under inverse mass,
+`wSum === 0 + 1 === 1` and the free end absorbs the **whole** correction,
+which is the standard position-based-dynamics behaviour.
+
+Measured on the cloth after 600 steps, worst-case constraint residual
+`|d - rest|` improves from **1.70973 to 0.83151** (mean 0.23144 to 0.21597),
+and in both builds the worst link is a pinned one. The change is an
+improvement, not a regression, so it is accepted and the golden fixture is
+re-captured from the post-refactor solver.
+
+**Consequence for verification:** the golden test can no longer prove "the
+mass refactor changed nothing", because it did. It is retained as a pin
+against *future* changes, and the fixture records which solver produced it.
 
 ## Section 2 — Constraint representation
 
@@ -168,7 +185,7 @@ reproducible. Tests must drive the solver directly:
 
 | Test | Asserts |
 |------|---------|
-| Golden positions | Cloth at fixed viewport, `friction = 0`, 600 manual steps, every particle within `1e-6` of a fixture captured from the pre-refactor build. Proves the mass refactor changed nothing. |
+| Golden positions | Cloth at fixed viewport, `friction = 0`, 600 manual steps, every particle within `1e-6` of the fixture. Pins the solver against unintended change. The fixture records which solver captured it; see the corrected note in Section 1. |
 | Weighted correction | A two-particle link with `invMass` 1 and 3 moves the lighter end three times as far; an `invMass` 0 end does not move at all. |
 | Range constraint | A joint under load stays within `[min, max]`; a rigid link (`min === max`) still converges to `rest`. |
 | Friction | Tangential velocity of a particle resting on the floor decreases step over step with `friction > 0`, and is preserved exactly with `friction === 0`. |
@@ -186,13 +203,22 @@ covered by its own test instead.
 
 ### Sequencing constraint
 
-The golden fixture must be captured from the current build **before** any
-refactor begins, and committed as test data. Capturing it afterwards would
-assert the new behaviour against itself and prove nothing.
+The golden fixture must be captured before the refactor it is meant to police,
+and committed as test data. Capturing it afterwards asserts new behaviour
+against itself and proves nothing.
+
+This was done, and it worked: the pre-refactor fixture detected a real
+behavioural change at pinned links that had been reasoned about incorrectly in
+this spec. Having established that the change is an improvement, the fixture is
+re-captured from the post-refactor solver and carries a `capturedFrom` field
+recording that.
 
 ## Success criteria
 
-- Golden position test passes: existing scenes are unchanged by the mass refactor.
+- Golden position test passes against a fixture captured from the post-refactor
+  solver, pinning all later work.
+- Free-free links are bit-identical to the pre-refactor solver; pinned-link
+  behaviour changes as documented in Section 1 and lowers constraint residual.
 - Friction changes the circle and cloth scenes in the intended direction, under
   its own test rather than the golden one.
 - Range constraints hold a joint within limits.
