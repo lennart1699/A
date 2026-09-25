@@ -234,19 +234,31 @@ spec is the document a future reader will trust.
 **Pinned links were under-relaxed.** The behaviour-preservation claim in
 Section 1 was wrong and the golden test caught it; see the correction there.
 
-**A pressurised body resting on a floor propels itself.** Pressure applied
-once per relaxation pass compounds against the wall clamp, and a resting
-jelly walked 255px sideways under vertical gravity alone. Applying pressure
-once per step and subtracting its net translation brings that to 3px, and
-`satisfyConstraints(world, iter)` now receives the pass index so a body can
-tell a mid-solve pass from the last.
+**A pressurised body resting on a floor propels itself.** First found on the
+jelly (255px of walking under vertical gravity alone) and patched by applying
+pressure once per step with its net translation removed. That patch left two
+defects, fixed on 2026-09-25:
 
-The blob is not fully fixed. A pure pressure ring on a high-friction floor
-still ratchets: ~290px over 900 steps at friction 0.2, against ~100px before
-friction existed. Each step leaves a small tangential impulse that friction
-grips instead of letting slide back. A real fix needs velocity-level contact
-resolution rather than position clamping, which is a larger change than this
-pass and is not attempted here.
+- *Inside-out cells.* A quad braced by four edges and both diagonals is rigid
+  only up to reflection, so a landing that slams a particle row through its
+  neighbour leaves a mirrored cell that satisfies every distance constraint
+  and never recovers. The jelly kept 7 of 49 cells permanently inverted and
+  lost 15-23% of its area. Each cell now carries a signed-area constraint
+  (`solveArea`), which reads an inverted cell as its largest possible error
+  and restores it. This replaces the jelly's global pressure term entirely.
+- *Walking after impact.* Walls were clamped once after all relaxation
+  passes, so each pass pushed a body's bottom row into the floor and its top
+  row up, and the clamp cancelled only the bottom half. A slammed jelly
+  walked 209px. Walls are now projected inside the loop (`projectBounds`),
+  with friction applied once per step (`applyFriction`); the slammed block
+  now moves 17px and a resting one 0.2px.
+
+The blob is not fixed and its cause was misdiagnosed earlier. Its pressure
+term pumps energy: kinetic energy plateaus and never decays while pressure
+is on. Friction rectifies that oscillation into walking (~290px over 900
+steps at friction 0.2, 0px at friction 0). In-loop wall projection does not
+change it, so the earlier suggestion that velocity-level contact would fix it
+is withdrawn.
 
 **Per-body damping.** The global 0.995 retains 74% of velocity per second,
 which settles cloth nicely and killed the pendulum in about three seconds.

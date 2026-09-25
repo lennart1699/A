@@ -610,3 +610,56 @@ test("a blob holds its area while resting", async () => {
     assert(area > 0.9, `blob deflated to ${(area * 100).toFixed(1)}% of rest area`);
   });
 });
+
+test("jelly cells never invert when the block lands", async () => {
+  await withPage(async page => {
+    // A quad braced by four edges and both diagonals is rigid only up to
+    // reflection, so a cell slammed inside-out on impact satisfies every
+    // distance constraint and stays folded forever. Count cells whose
+    // winding no longer matches the winding they were built with.
+    const r = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("jelly");
+      const signs = j => {
+        const C = j.cols, at = (x, y) => j.particles[y * C + x], out = [];
+        for (let y = 0; y < j.rows - 1; y++)
+          for (let x = 0; x < C - 1; x++) {
+            const a = at(x, y), b = at(x + 1, y), d = at(x, y + 1);
+            out.push(Math.sign((b.x - a.x) * (d.y - a.y) - (d.x - a.x) * (b.y - a.y)));
+          }
+        return out;
+      };
+      const before = w.bodies.map(signs);
+      for (let i = 0; i < 600; i++) w.step();
+      return w.bodies.map((j, bi) => ({
+        inverted: signs(j).filter((s, i) => s !== before[bi][i]).length,
+        area: Math.abs(j.area()) / j.restArea,
+      }));
+    });
+    r.forEach((j, i) => {
+      assert(j.inverted === 0, `jelly ${i} has ${j.inverted} inside-out cells after landing`);
+      assert(j.area > 0.9, `jelly ${i} kept only ${(j.area * 100).toFixed(1)}% of its area`);
+    });
+  });
+});
+
+test("a jelly dropped hard does not walk away afterwards", async () => {
+  await withPage(async page => {
+    // Regression: walls were clamped once after all relaxation passes, so
+    // each pass pushed the bottom row into the floor and the top row up by
+    // the same amount, and the clamp cancelled only the bottom half. The
+    // imbalance, rectified by friction, walked a slammed block ~209px.
+    const drift = await page.evaluate(() => {
+      const w = window.__world;
+      w.paused = true; setScene("jelly");
+      const j = w.bodies[0];
+      for (const p of j.particles) p.py = p.y - 40;   // slam it down
+      const cx = () => j.particles.reduce((a, p) => a + p.x, 0) / j.particles.length;
+      const x0 = cx();
+      for (let i = 0; i < 600; i++) w.step();
+      return cx() - x0;
+    });
+    assert(Math.abs(drift) < 40,
+      `a slammed jelly walked ${drift.toFixed(1)}px sideways with no horizontal push`);
+  });
+});

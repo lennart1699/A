@@ -90,6 +90,8 @@ class Particle {
     this.ax = 0; this.ay = 0;    // acceleration accumulated for this step
     this.baseInvMass = invMass;
     this.invMass = pinned ? 0 : invMass;
+    this.contactH = false;       // touched floor or ceiling this step
+    this.contactV = false;       // touched a side wall this step
   }
   get pinned() { return this.invMass === 0; }
 }
@@ -195,21 +197,32 @@ class World {
     g.vx = dx; g.vy = dy;
   }
 
-  // Clamp to the walls, and bleed the velocity running along each wall we
-  // touch. Verlet keeps velocity implicit in (x - px), so shedding a fraction
-  // f of it means walking the previous position that fraction closer to the
-  // current one. Without this a wheel slides instead of rolling.
-  constrainToBounds() {
-    const m = this.margin, w = this.width, h = this.height, f = this.friction;
+  // Walls are a constraint like any other, so they are projected inside the
+  // relaxation loop rather than once after it. Clamping only at the end let
+  // each pass push a body's bottom row into the floor and its top row up by
+  // the same amount; the clamp then cancelled just the bottom half, and the
+  // leftover kick -- rectified by friction -- walked a dropped jelly ~209px.
+  projectBounds() {
+    const m = this.margin, w = this.width, h = this.height;
     this.eachParticle(p => {
-      let hitV = false, hitH = false;
-      if (p.x < m) { p.x = m; hitV = true; }
-      else if (p.x > w - m) { p.x = w - m; hitV = true; }
-      if (p.y < m) { p.y = m; hitH = true; }
-      else if (p.y > h - m) { p.y = h - m; hitH = true; }
-      if (f <= 0) return;
-      if (hitH) p.px += (p.x - p.px) * f;   // floor or ceiling: bleed x
-      if (hitV) p.py += (p.y - p.py) * f;   // side wall: bleed y
+      if (p.x < m) { p.x = m; p.contactV = true; }
+      else if (p.x > w - m) { p.x = w - m; p.contactV = true; }
+      if (p.y < m) { p.y = m; p.contactH = true; }
+      else if (p.y > h - m) { p.y = h - m; p.contactH = true; }
+    });
+  }
+
+  // Bleed the velocity running along each wall a particle touched this step.
+  // Verlet keeps velocity implicit in (x - px), so shedding a fraction f of
+  // it means walking the previous position that fraction closer to the
+  // current one. Applied once per step: per pass it would compound eightfold.
+  // Without this a wheel slides instead of rolling.
+  applyFriction() {
+    const f = this.friction;
+    if (f <= 0) return;
+    this.eachParticle(p => {
+      if (p.contactH) p.px += (p.x - p.px) * f;   // floor or ceiling: bleed x
+      if (p.contactV) p.py += (p.y - p.py) * f;   // side wall: bleed y
     });
   }
 
@@ -218,10 +231,12 @@ class World {
     this.accumulateForces();
     this.integrate();
     this.followCursor();
+    this.eachParticle(p => { p.contactH = false; p.contactV = false; });
     for (let i = 0; i < this.iterations; i++) {
       for (const b of this.bodies) b.satisfyConstraints(this, i);
+      this.projectBounds();
     }
-    this.constrainToBounds();
+    this.applyFriction();
   }
 
   // Fixed timestep with an accumulator: the sim always advances in 1/60s
@@ -362,19 +377,19 @@ function strokeLinks(ctx, links, color) {
    its outward normal. Moving the whole ring out by h changes the enclosed
    area by about perimeter * h, so that is the offset to ask for.
 
-   Pressure is an internal force, so it must not translate the body. Two
-   things here keep it from doing so: the mean displacement is subtracted,
-   and callers apply this once per step rather than once per relaxation pass
-   (repeating it compounds against the wall clamp). Together those took the
-   jelly's sideways travel from 255px to 9px over 900 steps.
+   Pressure is an internal force, so it must not translate the body: the
+   mean displacement is subtracted, and the blob applies this once per step
+   rather than once per relaxation pass, since repeating it compounds.
 
-   KNOWN LIMITATION: a pure pressure ring resting on a high-friction floor
-   still ratchets. The blob travels ~290px over 900 steps at friction 0.2,
-   against ~100px before friction existed: each step's residual pressure
-   asymmetry is a small tangential impulse, which friction converts into grip
-   instead of letting it slide back. Fixing it properly needs velocity-level
-   contact resolution rather than position clamping, which is a larger change
-   than this pass. Drop friction toward 0 to see the blob hold still. */
+   KNOWN LIMITATION: this term pumps energy. With pressure on, the blob's
+   kinetic energy plateaus (~15 per 100-step block) and never decays; with
+   pressure off it reaches zero within 200 steps. At friction 0 the blob
+   oscillates in place with no drift; at friction 0.2 the same oscillation
+   is rectified into ~290px of walking over 900 steps. Projecting walls
+   inside the solver loop -- which fixed the jelly's walking -- does not
+   change this. The jelly no longer uses this helper: it holds volume with a
+   signed-area constraint per cell (solveArea), which cannot translate the
+   body by construction. */
 function solvePressure(ring, restArea, signedArea, pressure) {
   const n = ring.length;
   if (n < 3) return;
@@ -407,6 +422,43 @@ function solvePressure(ring, restArea, signedArea, pressure) {
     if (dx[i] === 0 && dy[i] === 0) continue;
     ring[i].x += dx[i] - mx;
     ring[i].y += dy[i] - my;
+  }
+}
+
+/* Hold a polygon's *signed* area at its rest value. Distance constraints
+   cannot do this: a braced quad is rigid only up to reflection, so a cell
+   slammed inside-out still satisfies every edge and diagonal and stays
+   folded for good. Signed area can tell the two apart -- an inverted cell
+   reads as -rest, the largest error there is, and is driven straight back.
+
+   Standard position-based form: C = A - rest, with the gradient of polygon
+   area at vertex i being half the perpendicular of (next - prev). Those
+   gradients sum to zero, so the correction reshapes the cell without ever
+   moving it, which is why this needs none of solvePressure's translation
+   bookkeeping. */
+function solveArea(poly, rest, k) {
+  const n = poly.length;
+  let area = 0;
+  for (let i = 0; i < n; i++) {
+    const p = poly[i], q = poly[(i + 1) % n];
+    area += p.x * q.y - q.x * p.y;
+  }
+  const C = area * 0.5 - rest;
+  if (C === 0) return;
+  let denom = 0;
+  const gx = new Array(n), gy = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const prev = poly[(i - 1 + n) % n], next = poly[(i + 1) % n];
+    gx[i] = 0.5 * (next.y - prev.y);
+    gy[i] = 0.5 * (prev.x - next.x);
+    denom += poly[i].invMass * (gx[i] * gx[i] + gy[i] * gy[i]);
+  }
+  if (denom < 1e-12) return;
+  const s = (C / denom) * k;
+  for (let i = 0; i < n; i++) {
+    const p = poly[i];
+    p.x -= s * p.invMass * gx[i];
+    p.y -= s * p.invMass * gy[i];
   }
 }
 
@@ -838,8 +890,9 @@ class Bridge extends Body {
 }
 
 /* ------------------------------------------------------------------ *
- * Jelly -- a filled grid with shear bracing and a pressure term, so it
- * wobbles and recovers where the cloth would simply fold.
+ * Jelly -- a filled grid with shear bracing, and a signed-area constraint
+ * on every cell so no cell can be folded inside-out. It wobbles and
+ * recovers where the cloth would simply fold.
  * ------------------------------------------------------------------ */
 
 class Jelly extends Body {
@@ -847,7 +900,6 @@ class Jelly extends Body {
     super();
     this.links = [];
     this.cols = cols; this.rows = rows;
-    this.pressure = 0.7;
     const ox = cx - ((cols - 1) * spacing) / 2;
     const oy = cy - ((rows - 1) * spacing) / 2;
     for (let y = 0; y < rows; y++)
@@ -863,6 +915,18 @@ class Jelly extends Body {
           this.links.push(makeLink(at(x, y), at(x + 1, y + 1)));
           this.links.push(makeLink(at(x + 1, y), at(x, y + 1)));
         }
+      }
+    // Each cell wound a -> b -> c -> d, with the signed area it was built at.
+    this.cells = [];
+    for (let y = 0; y < rows - 1; y++)
+      for (let x = 0; x < cols - 1; x++) {
+        const poly = [at(x, y), at(x + 1, y), at(x + 1, y + 1), at(x, y + 1)];
+        let a2 = 0;
+        for (let i = 0; i < 4; i++) {
+          const p = poly[i], q = poly[(i + 1) % 4];
+          a2 += p.x * q.y - q.x * p.y;
+        }
+        this.cells.push({ poly, rest: a2 * 0.5 });
       }
     this.hull = [];
     for (let x = 0; x < cols; x++) this.hull.push(at(x, 0));
@@ -882,12 +946,9 @@ class Jelly extends Body {
     return a * 0.5;
   }
 
-  satisfyConstraints(world, iter) {
+  satisfyConstraints(world) {
     solveLinks(this.links, world.stiffness);
-    // The braced grid holds the shape; pressure restores the area it loses
-    // on impact. Applied to the outer ring only.
-    if (iter === world.iterations - 1)
-      solvePressure(this.hull, this.restArea, this.area(), this.pressure);
+    for (const c of this.cells) solveArea(c.poly, c.rest, world.stiffness);
   }
 
   tear(x, y, radius) { tearLinks(this.links, x, y, radius); }
